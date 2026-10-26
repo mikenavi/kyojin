@@ -16,6 +16,9 @@ The GLM path is a metadata-only regression fixture, not a fleet GLM deployment.
 JSON SSE buffers until validation. JSON with tools, stop or ignore_eos is400;
 incomplete JSON is an error. Ordinary text/tool streams retain upstream behavior.
 
+Loop guard: inside a Qwen tool call the answer text/counter rules skip (repeated source paths in a
+result file were cut as a loop); an exact period must hold 2048 tokens. tools/qwen/test_guard.py ToolCallTests.
+
 Update by merging/rebasing upstream into this branch, running regressions and
 publishing a new immutable fleet tag. Deploy exact commit/image digests. A source
 export does not qualify a new compiler, GPU backend or long-context workload.

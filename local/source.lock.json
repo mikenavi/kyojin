@@ -8,7 +8,8 @@
     "tools/glm/serve.py": "086c6a08763f3551e06937235390cd993f05479243a6b079ea0dcd17343931da",
     "tools/structured_output.py": "d8d2552bf7fd92eeb66965d9f2d3971098479f88d2a95abb9692b05975f4f3d0",
     "exllamav3/generator/filter/structured.py": "2cf31bc1d68c5712739af735bbb1020ed60dd6fe320bf014bcdd0d9f2d7b426e",
-    "exllamav3/generator/filter/llguidance.py": "4ee542214b794dd30e00d8b51d68a456931a2b57ac1e745c3c317c710589caf1"
+    "exllamav3/generator/filter/llguidance.py": "4ee542214b794dd30e00d8b51d68a456931a2b57ac1e745c3c317c710589caf1",
+    "tools/loopguard.py": "06b0ea44cf522f6f26a4f28eaaa0dc2edbccfb81b03f137e993f8d70e021bf3b"
   },
   "source_only_export": true,
   "target": "Linux gfx1151 with an external pinned ROCm toolchain",
