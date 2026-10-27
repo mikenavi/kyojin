@@ -35,6 +35,9 @@ This does not restore multimodal identities from persisted KV slots after restar
 The directory contains derived attachment data, not a conversation archive.
 The full request still holds its embedding rows; cache limits are not peak request
 RAM limits. Per-request vision builds and cumulative disk counters are logged.
+If a failed write cannot remove its temporary file, further spill writes stop
+until restart so the leftover reservation cannot exceed the byte quota. Existing
+verified entries remain readable, and misses continue with fresh IDs.
 Run `tools/qwen/test_attachment_cache.py` without GPU, setting QWEN_JSON_MODEL
 to a tokenizer/config fixture for the real tokenization gate.
 
@@ -52,5 +55,12 @@ candidate vision checks and eleven short JSON/text/tool regressions. In one
 129-image comparison, the parent's repeat reused 0 of 9893 prompt tokens
 (8.750 s); the candidate reused 9728 tokens (0.570 s), with zero vision builds
 on repeat. This is a targeted cache regression, not a workload speed guarantee
-or a new 512K quality qualification. CPU checks passed 174 tests with one upstream
+or a new 512K quality qualification. CPU checks passed 176 tests with one upstream
 template fixture skip. The exact native SDK/ELF and JSON dependencies were retained.
+
+Review fault injection reproduced two storage-failure bugs before the fixes:
+an existing-file stat could abort RAM eviction, and failed temporary cleanup
+could bypass the disk quota. Both are covered by regressions. The final reviewed
+payload passed all 19 attachment tests and repeated the seven GPU cache checks
+plus eleven short regressions. Its 129-image repeat reused 9728 of 9893 tokens
+(0.576 s wall); no vision re-encoding was needed.

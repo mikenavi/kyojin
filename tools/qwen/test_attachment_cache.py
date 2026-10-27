@@ -147,6 +147,66 @@ class AttachmentTests(unittest.TestCase):
         again = eng._embed(self.images("a"))[0]
         self.assertNotEqual(first.first_index, again.first_index)
 
+    def test_existing_file_stat_error_does_not_abort_ram_eviction(self):
+        eng = self.engine(max_bytes=1)
+        first = eng._embed(self.images("a"))[0]
+        disk = eng.emb_cache.backing
+        for error in (PermissionError(errno.EACCES, "denied"), OSError(errno.EIO, "I/O error")):
+            with patch.object(Path, "is_file", side_effect=error):
+                # fetch verifies and reads the exact rows before trim tries to
+                # check the already stored file. A stat failure must stay local.
+                again = eng._embed(self.images("a"))[0]
+            self.assertEqual(first.token_list, again.token_list)
+            self.assertEqual(len(eng.emb_cache), 0)
+            self.assertEqual(eng.emb_cache.nbytes, 0)
+        self.assertEqual(disk.stats["errors"], 2)
+        self.assertEqual(disk.stats["rejected"], 2)
+        self.assertFalse(list(disk.root.glob("*.partial")))
+        # If the stored data is subsequently lost, normal fresh-ID rebuilding
+        # still works; the earlier errors must not poison RAM accounting.
+        disk.records[("a", 0)]["path"].unlink()
+        rebuilt = eng._embed(self.images("a"))[0]
+        self.assertNotEqual(first.first_index, rebuilt.first_index)
+        self.assertEqual(eng.emb_cache.nbytes, 0)
+        self.assertEqual(self.calls, 2)
+
+    def test_failed_partial_cleanup_cannot_exceed_disk_quota(self):
+        eng = self.engine(max_bytes=1)
+        eng._embed(self.images("s"))
+        disk = eng.emb_cache.backing
+        disk.max_bytes = disk.nbytes
+        disk.clear()
+        unlink = Path.unlink
+
+        def failed_save(value, stream):
+            stream.write(b"x" * (disk.max_bytes // 2))
+            raise OSError(errno.EIO, "write failed")
+
+        def failed_cleanup(path, *args, **kwargs):
+            if path.suffix == ".partial":
+                raise OSError(errno.EIO, "unlink failed")
+            return unlink(path, *args, **kwargs)
+
+        with patch("torch.save", side_effect=failed_save), patch.object(Path, "unlink", failed_cleanup):
+            first = eng._embed(self.images("a"))[0]
+        leftovers = list(disk.root.glob("*.partial"))
+        self.assertEqual(len(leftovers), 1)
+        # Even after the filesystem recovers, writes must not consume the
+        # unaccounted reservation. Request handling continues with fresh IDs.
+        for key in ("b", "c", "a"):
+            result = eng._embed(self.images(key))[0]
+            payload_bytes = sum(f.stat().st_size for f in disk.root.iterdir() if f.suffix in (".pt", ".partial"))
+            self.assertLessEqual(payload_bytes, disk.max_bytes)
+        self.assertNotEqual(first.first_index, result.first_index)
+        self.assertEqual(eng.emb_cache.nbytes, 0)
+        self.assertTrue(disk._writes_disabled)
+        disk.close()
+        restarted = self.engine(max_bytes=1)
+        restored = restarted._embed(self.images("a"))[0]
+        self.assertFalse(list(restarted.emb_cache.backing.root.glob("*.partial")))
+        self.assertFalse(restarted.emb_cache.backing._writes_disabled)
+        self.assertEqual(restored.first_index, restarted._embed(self.images("a"))[0].first_index)
+
     def test_restart_discards_crash_leftovers_and_old_identities(self):
         eng = self.engine(max_bytes=1)
         first = eng._embed(self.images("a"))[0]

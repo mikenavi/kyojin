@@ -10,10 +10,10 @@
     "exllamav3/generator/filter/structured.py": "2cf31bc1d68c5712739af735bbb1020ed60dd6fe320bf014bcdd0d9f2d7b426e",
     "exllamav3/generator/filter/llguidance.py": "4ee542214b794dd30e00d8b51d68a456931a2b57ac1e745c3c317c710589caf1",
     "tools/loopguard.py": "06b0ea44cf522f6f26a4f28eaaa0dc2edbccfb81b03f137e993f8d70e021bf3b",
-    "tools/qwen/attachment_cache.py": "abc4a49183245bbb2f70009853a26d6490d27d2e405b9ae90a3bdf8cb33e722a",
+    "tools/qwen/attachment_cache.py": "a36f9c4f52bc987b4a218c621d64f623774d7c8264088797b9e44bb34eacc3a9",
     "tools/strix_halo/image_cache.py": "7bf52cc1a25e1a909e9c659f362d1ea96b278c60c948137cdbc5336f20d51b77"
   },
   "source_only_export": true,
   "target": "Linux gfx1151 with an external pinned ROCm toolchain",
-  "qualification": "Qwen attachment cache: 174 CPU tests passed, one upstream template fixture skip; gfx1151/MTP GPU passed 129-image reuse, forced-cold parity, changed image and repeated occurrence checks plus 11 short JSON/text/tool regressions on 2026-10-27. Existing native SDK/ELF retained; no new 512K/workload or other-backend qualification."
+  "qualification": "Qwen attachment cache: 176 CPU tests passed, one upstream template fixture skip; gfx1151/MTP GPU passed 129-image reuse, forced-cold parity, changed image and repeated occurrence checks plus 11 short JSON/text/tool regressions on 2026-10-27. Existing native SDK/ELF retained; no new 512K/workload or other-backend qualification. Review fixes cover stat-error RAM accounting and failed-partial-cleanup quota protection; final payload repeated all GPU checks."
 }

@@ -75,6 +75,7 @@ class AttachmentStore:
         self.stats = dict(hits=0, writes=0, misses=0, errors=0, evictions=0, rejected=0)
         self.epoch = uuid.uuid4().hex
         self._lease = None
+        self._writes_disabled = False
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         st = self.root.lstat()
         if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
@@ -138,11 +139,15 @@ class AttachmentStore:
     def store(self, slot, emb):
         if self._lease is None:
             return
-        rec = self.records.get(slot)
-        if rec and rec["first_index"] == emb.first_index and rec["path"].is_file():
+        if self._writes_disabled:
+            self.stats["rejected"] += 1
             return
-        temporary = self.root / (uuid.uuid4().hex + ".partial")
+        rec = self.records.get(slot)
+        temporary = None
         try:
+            if rec and rec["first_index"] == emb.first_index and rec["path"].is_file():
+                return
+            temporary = self.root / (uuid.uuid4().hex + ".partial")
             import torch
             if rec:
                 self._drop(slot)
@@ -172,10 +177,17 @@ class AttachmentStore:
             if not isinstance(exc, OSError) or exc.errno != errno.ENOSPC:
                 self._error(exc)
         finally:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError as exc:
-                self._error(exc)
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError as exc:
+                    # The partial still consumes the reserved quota. Stop new
+                    # writes until a new store cleans it up under the lease;
+                    # otherwise unindexed leftovers could exceed the byte cap.
+                    self._writes_disabled = True
+                    self._error(exc)
+                    print("qserve: attachment spill writes disabled after failed cleanup; "
+                          "existing entries remain readable until restart", flush=True)
 
     def fetch(self, slot):
         rec = self.records.get(slot)

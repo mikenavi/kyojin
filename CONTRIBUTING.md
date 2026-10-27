@@ -44,7 +44,7 @@ If a test or the first import hangs, look for a stale lock file at `~/.cache/tor
 ## Code and commit conventions
 
 - Python: follow the style of the file you edit. Keep functions small and name things for what they do.
-- Environment switches use the `EXL3_` prefix (for example `EXL3_ABLIT_RUNTIME`). Document each new switch next to the code that reads it.
+- Engine/backend environment switches use the `EXL3_` prefix (for example `EXL3_ABLIT_RUNTIME`). Serving-layer settings and API test credentials use the existing `KYOJIN_` namespace, as in `KYOJIN_IMAGE_CACHE_POLICY`, `KYOJIN_REQLOG_DIR` and `KYOJIN_ATTACHMENT_CACHE_DIR`. Document each new switch next to the code that reads it.
 - Commit subjects are short, in English, in the imperative, with no prefix and no trailing period (for example: `Fix union MoE RM=8 kernels: process rows in groups of 4`). Add a body when the reason is not obvious.
 - Make normal commits. Do not rewrite history on a branch others use.
 
