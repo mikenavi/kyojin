@@ -79,10 +79,18 @@ class ImageEmbeddingCache:
     prompt", while a server running `--sessions N` passes N (or a little more) so that concurrent conversations do
     not evict each other's heads. `policy` overrides the environment; the default is the LRU a server had before
     the switch existed. Thread safe: one vision pass per picture, also across requests.
+
+    `backing`, when supplied, implements set_order(slots), fetch(slot),
+    store(slot, embedding) and clear(). It must restore exact rows AND token IDs,
+    distinguish occurrences, bound its own storage, and treat I/O failures as
+    cache misses. All callbacks run under this cache's lock. RAM trimming does
+    not discard a backed attachment's identity. `clear()` clears both tiers.
     """
 
     def __init__(self, max_items: int = DEFAULT_MAX_ITEMS, max_bytes: int = DEFAULT_MAX_BYTES,
-                 max_orders: int = DEFAULT_MAX_ORDERS, policy: str | None = None):
+                 max_orders: int = DEFAULT_MAX_ORDERS, policy: str | None = None,
+                 backing: Any = None):
+        self.backing = backing  # optional lossless store keyed by (content, occurrence)
         self.max_items = max(0, int(max_items))
         self.max_bytes = max(0, int(max_bytes))
         self.max_orders = max(1, int(max_orders))
@@ -119,6 +127,8 @@ class ImageEmbeddingCache:
             self._items.clear()
             self._orders.clear()
             self._nbytes = 0
+            if self.backing is not None:
+                self.backing.clear()
 
     def _over_budget(self) -> bool:
         return bool((self.max_items and len(self._items) > self.max_items) or
@@ -171,6 +181,8 @@ class ImageEmbeddingCache:
                 break
             item = self._items.pop(slot, None)
             if item is not None:
+                if self.backing is not None:
+                    self.backing.store(slot, item[0])
                 self._nbytes -= item[1]
                 gone += 1
                 if evicted is not None:
@@ -195,6 +207,13 @@ class ImageEmbeddingCache:
         out, seen = [], collections.Counter()
         order: list = []
         with self._lock:
+            if self.backing is not None:
+                counts = collections.Counter()
+                slots = []
+                for _, key in images:
+                    slots.append((key, counts[key]))
+                    counts[key] += 1
+                self.backing.set_order(slots)
             for image, key in images:
                 slot = (key, seen[key])
                 seen[key] += 1
@@ -203,7 +222,9 @@ class ImageEmbeddingCache:
                     mine.add(key)
                 hit = self._items.get(slot)
                 if hit is None:
-                    emb = fetch(image, key) if fetch is not None else None
+                    emb = self.backing.fetch(slot) if self.backing is not None else None
+                    if emb is None and fetch is not None:
+                        emb = fetch(image, key)
                     if emb is None:
                         emb = build(image)
                     n = embedding_nbytes(emb)
