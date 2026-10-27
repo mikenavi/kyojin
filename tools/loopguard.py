@@ -42,6 +42,8 @@ ANSWER_SATURATED = 0.07                       # answer rule: zlib ratio of the l
 ANSWER_UNIT_MIN, ANSWER_UNITS_MIN, ANSWER_UNITS_ALONE = 25, 0.3, 0.6   # answer rule: share of repeated lines / sentences
 DATA_LETTERS_MAX, DATA_MIN_CHARS, DATA_SUSTAIN = 0.10, 40, 16384   # content check: letters share of a data tail; tokens a data repetition may run before it is cut anyway
 COUNTER_SUSTAIN, COUNTER_RATIO = 2000, 0.09   # counter arm: tokens it must hold, zlib ratio of the last 3000 characters (valid ramps: 0.10 and up)
+TOOL_CALL_OPEN, TOOL_CALL_CLOSE = re.compile(r"<tool_call>\s*(?:<function=|\{)"), "</tool_call>"   # Qwen tool-call block
+CALL_PERIOD_SUSTAIN = 2048   # tokens an exact period must hold inside a tool call (the text and counter rules skip calls)
 
 
 def counter_drift(text: str) -> bool:
@@ -157,6 +159,40 @@ class LoopMonitor:
         self.flag_from: int | None = None
         self.counter_from: int | None = None
         self._data_at, self._data = -GUARD_CHECK_EVERY, False   # data_like() of the tail, refreshed every GUARD_CHECK_EVERY tokens
+        self.in_call, self._call_tail = False, ""
+
+    def _tool_call(self, text: str) -> bool:
+        """True when this piece of the answer belongs to a tool call: from a <tool_call> that opens one (<function= or a JSON
+        object follows it, the rule of the Qwen Splitter; a quoted tag is text) to </tool_call>. The arguments are data the
+        client asked for, not the model's prose: a result file citing the same source path in each record tripped the text
+        rule after 1-5K tokens and cut the call (finish length). Inside a call only an exact period that holds for
+        CALL_PERIOD_SUSTAIN tokens stops it (a model stuck in its arguments repeats tokens exactly); the text after it is
+        watched afresh."""
+        seen, touched, pos = self._call_tail + text, self.in_call, 0
+        while True:
+            if self.in_call:
+                k = seen.find(TOOL_CALL_CLOSE, pos)
+                if k < 0:
+                    break
+                self.in_call, pos = False, k + len(TOOL_CALL_CLOSE)
+                self.run, self.text, self.flag_from, self.counter_from = [0] * (GUARD_MAX_N + 1), "", None, None
+                self._data_at = -GUARD_CHECK_EVERY
+            else:
+                m = TOOL_CALL_OPEN.search(seen, pos)
+                if m is None:
+                    break
+                self.in_call, pos, touched = True, m.end(), True
+        self._call_tail = seen[max(pos, len(seen) - 32):]
+        if not self.in_call:
+            # Splitter accepts arbitrary whitespace after the tag. Keep an
+            # undecided opener without retaining all of that whitespace.
+            tag = "<tool_call>"
+            start = seen.rfind(tag, pos)
+            if start >= 0:
+                rest = seen[start + len(tag):].lstrip()
+                if not rest or "<function=".startswith(rest):
+                    self._call_tail = tag + rest
+        return touched
 
     def _data_tail(self, at: int) -> bool:
         if at - self._data_at >= GUARD_CHECK_EVERY:
@@ -175,6 +211,7 @@ class LoopMonitor:
         return self._feed(tokens, text)
 
     def _feed(self, tokens, text: str) -> dict[str, Any] | None:
+        call = self.detect and self.phase == "answer" and self._tool_call(text)
         ids, run, cfg = self.ids, self.run, self.cfg
         self.text += text
         for t in tokens:
@@ -187,11 +224,13 @@ class LoopMonitor:
             for n in range(1, GUARD_MAX_N + 1):
                 r = run[n] + 1 if i >= n and t == ids[i - n] else 0
                 run[n] = r
-                if r >= max(n * (cfg["k"] - 1), cfg["min_span"] - n):
+                if r >= max(n * (cfg["k"] - 1), cfg["min_span"] - n, CALL_PERIOD_SUSTAIN if call else 0):
                     if r < DATA_SUSTAIN and self.phase == "answer" and self._data_tail(i):
                         continue   # legit repetitive data: the period must hold for DATA_SUSTAIN tokens before it is a loop
                     return {"phase": self.phase, "kind": "period", "cut": max(i - r + 1, 1), "at": i + 1, "period": n}
-        if self.detect and len(ids) - self.last_check >= GUARD_CHECK_EVERY:
+        if call:
+            self.last_check = len(ids)         # inside a tool call only an exact period stops it
+        elif self.detect and len(ids) - self.last_check >= GUARD_CHECK_EVERY:
             prev, self.last_check = self.last_check, len(ids)
             if (answer_text_loop if self.phase == "answer" else text_loop)(self.text[-(SPAN_TAIL + 200):]):
                 if self.flag_from is None:

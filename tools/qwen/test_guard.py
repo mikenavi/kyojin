@@ -655,6 +655,54 @@ class DetectorTests(unittest.TestCase):
             self.assertEqual(serve.text_loop(s), bool(loops.is_loop(s)))
 
 
+_SOURCE = "evidence-pack.zip/01. Funding/Bank statement 00000000000000000000 for 2025-01-01..2025-12-31.pdf, p. 2"
+_RECORDS = ",\n".join(f'  "{q}": {{"status": "yes", "score": {q * 5 % 50}, "comment": "Question {q}: the amount of '
+                      f'{q * 37000} is confirmed by the statement", "sources": ["{_SOURCE}"]}}' for q in range(1, 41))
+
+
+class ToolCallTests(unittest.TestCase):
+    """A tool call writing a result file (the same source path in every record) tripped the answer text rule after about
+    1K tokens and the call was cut (finish length, the client lost the call). The rules skip a call; prose stays watched."""
+
+    CALL = ("Writing the result.\n\n<tool_call>\n<function=write>\n<parameter=path>\n/work/output/result.json\n</parameter>\n"
+            "<parameter=content>\n{\n" + _RECORDS + "\n}\n</parameter>\n</function>\n</tool_call>")
+    LOOP = "Let me check this document again and come back to the question. " * 120
+
+    def test_result_file_call_is_not_cut(self):
+        plain = self.CALL.replace("<tool_call>", "").replace("</tool_call>", "")
+        for chunk in (1, 4, 7):
+            self.assertIsNotNone(run_monitor(plain, "answer", chunk=chunk))      # the same text as prose: the rule fires
+            self.assertIsNone(run_monitor(self.CALL, "answer", chunk=chunk))
+            json_call = self.CALL.replace("<function=write>", '{"name": "write", "arguments": ')
+            self.assertIsNone(run_monitor(json_call, "answer", chunk=chunk))
+
+    def test_prose_after_a_call_and_a_quoted_tag_are_still_watched(self):
+        hit = run_monitor(self.CALL + "\n" + self.LOOP, "answer", chunk=4)
+        self.assertIsNotNone(hit)
+        self.assertGreater(hit["cut"], len(tokenize(self.CALL)[0]))            # cut counts the call's tokens too
+        self.assertIsNotNone(run_monitor("The `<tool_call>` format is described above. " + self.LOOP, "answer", chunk=4))
+
+    def test_long_whitespace_before_a_call_opener_is_preserved(self):
+        for gap in (" " * 40, "\n" * 80, "\t" * 64):
+            call = self.CALL.replace("<tool_call>\n", "<tool_call>\n" + gap)
+            for form in (call, call.replace("<function=write>", '{"name": "write", "arguments": ')):
+                for chunk in (1, 4, 7):
+                    with self.subTest(gap=repr(gap[:2]), chunk=chunk):
+                        self.assertIsNone(run_monitor(form, "answer", chunk=chunk))
+
+    def test_exact_loop_inside_a_call_is_stopped_after_the_call_sustain(self):
+        import loopguard
+        start = len(tokenize(self.CALL.split("<parameter=content>")[0] + "<parameter=content>\n")[0])
+        looping = self.CALL.split("<parameter=content>")[0] + "<parameter=content>\n" + "Repeated line number zero.\n" * 2000
+        hit = run_monitor(looping, "answer", chunk=4)
+        self.assertEqual(hit["kind"], "period")
+        self.assertGreaterEqual(hit["at"] - start, loopguard.CALL_PERIOD_SUSTAIN)
+        self.assertLess(hit["at"] - start, loopguard.CALL_PERIOD_SUSTAIN + 64)
+
+    def test_think_phase_is_unchanged(self):
+        self.assertIsNotNone(run_monitor("<tool_call>\n<function=f>\n" + self.LOOP, "think", chunk=4))
+
+
 class TextGenerator(StubGenerator):
     """StubGenerator whose events carry real text: tokens >= 3000 map to pieces of `answer`."""
     pieces: list = []
