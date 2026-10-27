@@ -1850,7 +1850,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                         await writer.write(sse(event({key: piece})))
                         ping.note_output()   # the client has text: comments wait for the next silence
                 if structured is not None:
-                    msg = structured_output.message(full, job["reasoning_first"])
+                    msg = structured.message(full, job["reasoning_first"])
                     structured.validate(msg, stats)
                     for key in ("reasoning_content", "content"):
                         if msg.get(key):
@@ -1911,13 +1911,14 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             return web.json_response({"error": {"message": f"{type(exc).__name__}: {exc}", "type": "server_error"}},
                                      status=500)
         text, _ = stop_text(full, job["stop"])
-        message = (structured_output.message(text, job["reasoning_first"]) if structured is not None else
-                   split_completion(text, job["reasoning_first"], job["tools"]))
         if structured is not None:
             try:
+                message = structured.message(text, job["reasoning_first"])
                 structured.validate(message, stats)
             except structured_output.OutputError as exc:
                 return err(502, str(exc))
+        else:
+            message = split_completion(text, job["reasoning_first"], job["tools"])
         reason, usage, timings = finish_and_stats(stats, text, "tool_calls" in message)
         if structured is not None:
             reason = "stop"

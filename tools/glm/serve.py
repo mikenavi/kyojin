@@ -1728,7 +1728,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                     await flush(True)
                     message = parse_completion(text)
                 else:
-                    message = structured_output.message(text[len(prefix):], bool(prefix))
+                    message = structured.message(text[len(prefix):], bool(prefix))
                     structured.validate(message, request_stats)
                     for key in ("reasoning_content", "content"):
                         if message.get(key):
@@ -1774,13 +1774,14 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             cancel.set()
             raise
         text, _ = stop_text(prefix + raw, body["_stop"])
-        message = (structured_output.message(text[len(prefix):], bool(prefix)) if structured is not None else
-                   parse_completion(text))
         if structured is not None:
             try:
+                message = structured.message(text[len(prefix):], bool(prefix))
                 structured.validate(message, request_stats)
             except structured_output.OutputError as exc:
                 return web.json_response({"error": {"message": str(exc), "type": "server_error"}}, status=502)
+        else:
+            message = parse_completion(text)
         finish = "stop" if structured is not None else finish_for(message, text[len(prefix):])
         payload = {
             "id": request_id, "object": "chat.completion", "created": created, "model": model_id,
