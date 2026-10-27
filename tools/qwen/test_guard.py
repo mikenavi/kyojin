@@ -682,6 +682,14 @@ class ToolCallTests(unittest.TestCase):
         self.assertGreater(hit["cut"], len(tokenize(self.CALL)[0]))            # cut counts the call's tokens too
         self.assertIsNotNone(run_monitor("The `<tool_call>` format is described above. " + self.LOOP, "answer", chunk=4))
 
+    def test_long_whitespace_before_a_call_opener_is_preserved(self):
+        for gap in (" " * 40, "\n" * 80, "\t" * 64):
+            call = self.CALL.replace("<tool_call>\n", "<tool_call>\n" + gap)
+            for form in (call, call.replace("<function=write>", '{"name": "write", "arguments": ')):
+                for chunk in (1, 4, 7):
+                    with self.subTest(gap=repr(gap[:2]), chunk=chunk):
+                        self.assertIsNone(run_monitor(form, "answer", chunk=chunk))
+
     def test_exact_loop_inside_a_call_is_stopped_after_the_call_sustain(self):
         import loopguard
         start = len(tokenize(self.CALL.split("<parameter=content>")[0] + "<parameter=content>\n")[0])

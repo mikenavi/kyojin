@@ -182,7 +182,16 @@ class LoopMonitor:
                 if m is None:
                     break
                 self.in_call, pos, touched = True, m.end(), True
-        self._call_tail = seen[max(pos, len(seen) - 32):]   # a tag or its opener split across pieces
+        self._call_tail = seen[max(pos, len(seen) - 32):]
+        if not self.in_call:
+            # Splitter accepts arbitrary whitespace after the tag. Keep an
+            # undecided opener without retaining all of that whitespace.
+            tag = "<tool_call>"
+            start = seen.rfind(tag, pos)
+            if start >= 0:
+                rest = seen[start + len(tag):].lstrip()
+                if not rest or "<function=".startswith(rest):
+                    self._call_tail = tag + rest
         return touched
 
     def _data_tail(self, at: int) -> bool:
