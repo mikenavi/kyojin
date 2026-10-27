@@ -42,6 +42,7 @@ sys.path.insert(0, str(HERE))
 sys.path.append(str(HERE.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 import image_cache  # noqa: E402  (shared bounded LRU of image embeddings; symlink to tools/strix_halo)
+import structured_output  # shared native JSON request contract
 import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /tokenize, usage details)
 from l21_prompt_encode_cache import PromptEncodeCache  # noqa: E402  (incremental prompt encode)
 # serve_ping.py is a symlink to the shared tools/strix_halo/serve_ping.py: an SSE comment line every
@@ -1208,7 +1209,7 @@ class QwenEngine:
                         cancel: asyncio.Event | None = None, seed: int | None = None, reasoning_first: bool = False,
                         thinking_budget: int | None = None, loop_guard: bool | None = None,
                         loop_final: bool | None = None, logprobs: int | None = None, stats: dict[str, Any],
-                        prompt_ids: list[int] | None = None, ignore_eos: bool = False, _mine: list) -> AsyncIterator[str]:
+                        prompt_ids: list[int] | None = None, ignore_eos: bool = False, structured=None, _mine: list) -> AsyncIterator[str]:
         """Yield decoded text pieces. Final stats land in `stats`. Every job enqueued is appended to `_mine`.
 
         Final check (on with the guard, loop_final=False turns it off): when the turn ends normally and the visible text
@@ -1270,10 +1271,13 @@ class QwenEngine:
         while True:
             max_new = max(max_tokens - generated + discount, 1)
             rq = serve_compat.rq_budget(ctx, self.sessions, int(job_ids.numel()), max_new, int(getattr(self.generator, "num_draft_tokens", 0)), PAGE_TOKENS)
+            if structured is not None:
+                structured.filter.restart(reasoning_first if job_ids is ids else False)
             job = self.Job(input_ids=job_ids, max_new_tokens=max_new,
                            sampler=self._sampler(sampling), stop_conditions=([] if ignore_eos else self.eos) + list(stop),
                            embeddings=embs or None, decode_special_tokens=True, seed=seed,
                            **({} if rq is None else {"max_rq_tokens": rq}),
+                           **({"filters": [structured.filter]} if structured is not None else {}),
                            **({} if logprobs is None else {"return_probs": True, "return_top_tokens": logprobs}))
             if disk_on and generated == 0 and not discount:
                 job._restore_ids = ids          # see _pre_start
@@ -1492,6 +1496,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
     """HTTP layer around a resident engine (also accepts a fake engine in tests)."""
     defaults = defaults or load_defaults("/nonexistent")
     queue: asyncio.Queue = asyncio.Queue()
+    compile_gate = asyncio.Semaphore(2)
     sessions = getattr(engine, "sessions", 1)
     gate = asyncio.Semaphore(sessions)   # one permit per running request; slot actions take them all (drain)
     lock = asyncio.Lock()                # serializes the slot actions
@@ -1602,7 +1607,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                                 cache_prompt=job["cache_prompt"], cancel=job["cancel"],
                                 seed=job.get("seed"), reasoning_first=job.get("reasoning_first", False),
                                 thinking_budget=job.get("thinking_budget"), loop_guard=job.get("loop_guard"),
-                                loop_final=job.get("loop_final"), logprobs=job.get("logprobs")):
+                                loop_final=job.get("loop_final"), logprobs=job.get("logprobs"),
+                                **({"structured": job["structured"]} if job.get("structured") is not None else {})):
                             if not first_token:
                                 first_token = True
                                 lifecycle.first_token(rid, started, prompt_tokens=job.get("prompt_tokens"))
@@ -1613,6 +1619,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                             store.busy = running > 0
                     # a fake engine (tests) fills only last_stats
                     done = dict(stats or getattr(engine, "last_stats", None) or {})
+                    if job.get("structured") is not None:
+                        done["structured_complete"] = job["structured"].filter.is_completed()
                     print(f"qserve: request prompt={int(done.get('prompt_tokens') or 0)} cached={int(done.get('cached_tokens') or 0)} "
                           f"new={int(done.get('new_tokens') or 0)} prefill_s={float(done.get('time_prefill') or 0):.3f} "
                           f"generate_s={float(done.get('time_generate') or 0):.3f} stop={done.get('eos_reason')}",
@@ -1724,6 +1732,12 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         try:
             body = await request.json()
             job = prepare(body)
+            if structured_output.requested(body):
+                async with compile_gate:
+                    job["structured"] = await asyncio.to_thread(
+                        structured_output.prepare, body, getattr(engine, "tokenizer", None), job["reasoning_first"])
+        except structured_output.RequestError as exc:
+            return err(exc.status, str(exc))
         except json.JSONDecodeError as exc:
             return err(400, f"invalid JSON: {exc}")
         except (BadRequest, serve_compat.CompatError) as exc:
@@ -1797,6 +1811,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                 yield item
 
         sp = Splitter(job["reasoning_first"])
+        structured = job.get("structured")
         if body.get("stream", False):
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
             await response.prepare(request)
@@ -1811,6 +1826,12 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                 async for item in pieces(writer, ping, ping_at):
                     if isinstance(item, dict):
                         stats = item
+                        continue
+                    if structured is not None:
+                        if isinstance(item, Retract):
+                            full = full[:len(full) - int(item)]
+                        else:
+                            full += item
                         continue
                     if isinstance(item, Retract):  # loop guard restart: this client already received the text
                         if sp.mode != "reasoning":
@@ -1827,6 +1848,12 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                             lifecycle.first_content(job["_reqid"], queued_at)
                         await writer.write(sse(event({key: piece})))
                         ping.note_output()   # the client has text: comments wait for the next silence
+                if structured is not None:
+                    msg = structured.message(full, job["reasoning_first"])
+                    structured.validate(msg, stats)
+                    for key in ("reasoning_content", "content"):
+                        if msg.get(key):
+                            await writer.write(sse(event({key: msg[key]})))
                 for kind, piece in sp.finish():
                     key = "reasoning_content" if kind == "reasoning" else "content"
                     await writer.write(sse(event({key: piece})))
@@ -1835,6 +1862,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                     for i, c in enumerate(calls):   # one stream message per call: some clients read only the first call of a message
                         await writer.write(sse(event({"tool_calls": [dict(c, index=i)]})))
                 reason, usage, timings = finish_and_stats(stats, full, bool(calls))
+                if structured is not None:
+                    reason = "stop"
                 final = event({}, reason) | {"usage": usage, "timings": timings}
                 if stats.get("eos_reason") == "loop_guard":
                     final["choices"][0]["stop_reason"] = "loop_guard"
@@ -1881,8 +1910,17 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             return web.json_response({"error": {"message": f"{type(exc).__name__}: {exc}", "type": "server_error"}},
                                      status=500)
         text, _ = stop_text(full, job["stop"])
-        message = split_completion(text, job["reasoning_first"], job["tools"])
+        if structured is not None:
+            try:
+                message = structured.message(text, job["reasoning_first"])
+                structured.validate(message, stats)
+            except structured_output.OutputError as exc:
+                return err(502, str(exc))
+        else:
+            message = split_completion(text, job["reasoning_first"], job["tools"])
         reason, usage, timings = finish_and_stats(stats, text, "tool_calls" in message)
+        if structured is not None:
+            reason = "stop"
         payload = {"id": request_id, "object": "chat.completion", "created": created, "model": model_id,
                    "choices": [{"index": 0, "message": message, "finish_reason": reason}],
                    "usage": usage, "timings": timings}

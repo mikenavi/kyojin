@@ -26,6 +26,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 from loopguard import AnswerTap, loop_guard_default  # noqa: E402  (answer-phase loop guard shared with the Qwen server)
+import structured_output  # shared native JSON request contract
 import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /tokenize, usage details)
 from l21_prompt_encode_cache import PromptEncodeCache  # noqa: E402  (incremental prompt encode)
 # serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
@@ -936,7 +937,7 @@ class ResidentEngine:
                        cancel: asyncio.Event | None = None,
                        images: list | None = None, stats: dict | None = None, img_stats: dict | None = None,
                        prompt_ids: list[int] | None = None, ignore_eos: bool = False,
-                       loop_guard: bool | None = None) -> AsyncIterator[str]:
+                       loop_guard: bool | None = None, structured=None) -> AsyncIterator[str]:
         """Yield incremental decoded text. With sessions == 1 the caller serializes access to this method; with
         sessions > 1 several calls may run at once and the final stats of a request land in `stats`.
 
@@ -987,6 +988,7 @@ class ResidentEngine:
         conditions = ([] if ignore_eos else list(self.config.eos_token_id_list)) + stop
         rq = serve_compat.rq_budget(getattr(self, "ctx", None), self.sessions, int(ids.numel()), max_tokens, getattr(self, "num_draft", 0))
         job = self.Job(input_ids=ids, max_new_tokens=max_tokens, sampler=sampler,
+                       **({"filters": [structured.filter]} if structured is not None else {}),
                        stop_conditions=conditions, embeddings=embs or None,
                        **({} if rq is None else {"max_rq_tokens": rq}))
         if self.sessions > 1:
@@ -1331,6 +1333,7 @@ ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/metrics": ("GET",), "/s
 def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     """Build the HTTP layer around a resident engine (also accepts a fake engine in tests)."""
     queue: asyncio.Queue[tuple[dict[str, Any], asyncio.Queue, dict[str, Any]]] = asyncio.Queue()
+    compile_gate = asyncio.Semaphore(2)
     lock = asyncio.Lock()  # serializes generation with slot save/restore
     sessions = int(getattr(engine, "sessions", 1))
     gate = asyncio.Semaphore(sessions)   # sessions > 1: one permit per running request; slot actions take them all
@@ -1497,7 +1500,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                             **({"prompt_ids": body["_prompt_ids"]} if body.get("_prompt_ids") is not None else {}),
                             **({"ignore_eos": True} if body.get("_ignore_eos") else {}),
                             **({"loop_guard": body["_loop_guard"]} if body.get("_loop_guard") is not None else {}),
-                            **({"stats": request_stats} if sessions > 1 else {})):
+                            **({"stats": request_stats} if sessions > 1 else {}),
+                            **({"structured": body["_structured"]} if body.get("_structured") is not None else {})):
                             if not first_token:
                                 first_token = True
                                 lifecycle.first_token(rid, started,
@@ -1509,6 +1513,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                             store.busy = running > 0
                     if sessions == 1:
                         request_stats.update(getattr(engine, "last_stats", None) or {})
+                    if body.get("_structured") is not None:
+                        request_stats["structured_complete"] = body["_structured"].filter.is_completed()
                     if request_stats:
                         observe(request_stats, body.get("_prompt_tokens") or int(request_stats.get("prompt_tokens", 0)))
                     log_job_done(rid, body, request_stats, started)
@@ -1616,6 +1622,13 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             for key in ("temperature", "top_p"):
                 if body.get(key) is None:
                     body[key] = SERVE_DEFAULTS[key]
+            body["_structured"] = None  # never trust client-supplied internal worker state
+            if structured_output.requested(body):
+                async with compile_gate:
+                    body["_structured"] = await asyncio.to_thread(
+                        structured_output.prepare, body, getattr(engine, "tokenizer", None), opens_thinking(prompt))
+        except structured_output.RequestError as exc:
+            return web.json_response({"error": {"message": str(exc), "type": "invalid_request_error", "code": exc.status}}, status=exc.status)
         except (json.JSONDecodeError, web.HTTPException, TypeError) as exc:
             if isinstance(exc, web.HTTPException):
                 raise
@@ -1640,6 +1653,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         lifecycle.queued(body["_reqid"], "/v1/chat/completions", queued_ahead=ahead,
                          prompt_tokens=prompt_tokens, messages=body["_messages"], images=len(images),
                          stream=bool(body.get("stream")))
+        structured = body.get("_structured")
         prefix = "<think>" if opens_thinking(prompt) else ""
         # This request's SSE keep-alive, and the moment its wait started: every comment counts from
         # there, which is what the client has actually been waiting for. Off (the default) this costs one
@@ -1711,14 +1725,22 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 ping.note_output()
                 async for delta in deltas(writer):
                     text += delta
-                    await flush(False)
+                    if structured is None:
+                        await flush(False)
                 text, _ = stop_text(text, body["_stop"])
-                await flush(True)
-                message = parse_completion(text)
+                if structured is None:
+                    await flush(True)
+                    message = parse_completion(text)
+                else:
+                    message = structured.message(text[len(prefix):], bool(prefix))
+                    structured.validate(message, request_stats)
+                    for key in ("reasoning_content", "content"):
+                        if message.get(key):
+                            await writer.write(sse(event({key: message[key]})))
                 if "tool_calls" in message:
                     for n, call in enumerate(message["tool_calls"]):   # one stream message per call (clients that read one call per message)
                         await writer.write(sse(event({"tool_calls": [dict(call, index=n)]})))
-                final = event({}, finish_for(message, text[len(prefix):])) | {"usage": usage(text[len(prefix):]), "timings": timings(text)}
+                final = event({}, "stop" if structured is not None else finish_for(message, text[len(prefix):])) | {"usage": usage(text[len(prefix):]), "timings": timings(text)}
                 if request_stats.get("eos_reason") == "loop_guard":
                     final["choices"][0]["stop_reason"] = "loop_guard"
                 await writer.write(sse(final))
@@ -1756,8 +1778,15 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             cancel.set()
             raise
         text, _ = stop_text(prefix + raw, body["_stop"])
-        message = parse_completion(text)
-        finish = finish_for(message, text[len(prefix):])
+        if structured is not None:
+            try:
+                message = structured.message(text[len(prefix):], bool(prefix))
+                structured.validate(message, request_stats)
+            except structured_output.OutputError as exc:
+                return web.json_response({"error": {"message": str(exc), "type": "server_error"}}, status=502)
+        else:
+            message = parse_completion(text)
+        finish = "stop" if structured is not None else finish_for(message, text[len(prefix):])
         payload = {
             "id": request_id, "object": "chat.completion", "created": created, "model": model_id,
             "choices": [{"index": 0, "message": message, "finish_reason": finish}],

@@ -43,6 +43,7 @@ class LLGuidanceFilter(Filter):
         gbnf_grammar: str | None = None,
         llg_grammar: str | None = None,
         consume_prefix: bool = False,
+        ll_tokenizer: LLTokenizer | None = None,
     ):
         """
         Constrained sampling filter backed by llguidance. Exactly one grammar source must be given:
@@ -67,6 +68,10 @@ class LLGuidanceFilter(Filter):
             i.e. the grammar is expected to match prefix_str + sampled tokens. If False (default),
             the grammar only constrains sampled tokens.
 
+        :param ll_tokenizer:
+            Optional tokenizer adapter for sampling integrations that must keep control IDs out of
+            ordinary text tokenization. If omitted, the normal cached HF tokenizer is used.
+
         Remaining parameters are as for Filter.
         """
         if not llguidance_available:
@@ -88,7 +93,7 @@ class LLGuidanceFilter(Filter):
         if isinstance(g_text, dict):
             g_text = json.dumps(g_text)
 
-        self._ll_tokenizer = create_ll_tokenizer(tokenizer)
+        self._ll_tokenizer = ll_tokenizer if ll_tokenizer is not None else create_ll_tokenizer(tokenizer)
         self._grammar = grammar_from(g_format, g_text)
         err = LLMatcher.validate_grammar(self._grammar, self._ll_tokenizer)
         if err:
