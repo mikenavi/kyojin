@@ -4,16 +4,24 @@
   "upstream_base": "0c5b91a0686acc8129190f753e032715f0b0dcc2",
   "component": "kyojin",
   "product_files": {
-    "tools/qwen/serve.py": "047f092ee1a03a940be61e2d7c5f0004903123f8b2d192f40bc2580dcd5a68e1",
-    "tools/glm/serve.py": "086c6a08763f3551e06937235390cd993f05479243a6b079ea0dcd17343931da",
-    "tools/structured_output.py": "d8d2552bf7fd92eeb66965d9f2d3971098479f88d2a95abb9692b05975f4f3d0",
-    "exllamav3/generator/filter/structured.py": "2cf31bc1d68c5712739af735bbb1020ed60dd6fe320bf014bcdd0d9f2d7b426e",
+    "tools/qwen/serve.py": "af653b8220949cdfe6141170e433bbf8cc3d104df7f543904f7236b45b761989",
+    "tools/glm/serve.py": "8ff576d2aef3d957cc03ffafe6405235f72f29120accd390a42546600f60e0b6",
+    "tools/structured_output.py": "1432716dd08ea65cf5c85d1dbc089be9911a887a07047f03e0037c44391f60ae",
+    "exllamav3/generator/filter/structured.py": "81304055f9f3b7cd5fe4962ca6f609d7e6711284b3965e4ff6c281f51f94e0c2",
     "exllamav3/generator/filter/llguidance.py": "4ee542214b794dd30e00d8b51d68a456931a2b57ac1e745c3c317c710589caf1",
-    "tools/loopguard.py": "06b0ea44cf522f6f26a4f28eaaa0dc2edbccfb81b03f137e993f8d70e021bf3b",
+    "tools/loopguard.py": "b9e8a9479fe9769e406d9a8810c15fa886a34648ab3a50f7c662515245e31e23",
     "tools/qwen/attachment_cache.py": "a36f9c4f52bc987b4a218c621d64f623774d7c8264088797b9e44bb34eacc3a9",
-    "tools/strix_halo/image_cache.py": "7bf52cc1a25e1a909e9c659f362d1ea96b278c60c948137cdbc5336f20d51b77"
+    "tools/strix_halo/image_cache.py": "7bf52cc1a25e1a909e9c659f362d1ea96b278c60c948137cdbc5336f20d51b77",
+    "exllamav3/modules/attention_fn/triton_paged.py": "7ddd1ae895f8601315faf93a9ca0adba8e4b3c563bb785e22ad590f445a8df0d"
   },
   "source_only_export": true,
   "target": "Linux gfx1151 with an external pinned ROCm toolchain",
-  "qualification": "Qwen attachment cache: 176 CPU tests passed, one upstream template fixture skip; gfx1151/MTP GPU passed 129-image reuse, forced-cold parity, changed image and repeated occurrence checks plus 11 short JSON/text/tool regressions on 2026-10-27. Existing native SDK/ELF retained; no new 512K/workload or other-backend qualification. Review fixes cover stat-error RAM accounting and failed-partial-cleanup quota protection; final payload repeated all GPU checks."
+  "qualification": "Review fixes passed independent CPU/API tests on their contribution branches. Integrated source and fp16-prefill backport are prepared for a staged rebuild; GPU validation and activation are separate and pending.",
+  "upstream_backports": [
+    {
+      "commit": "f5e240c9b990dd8282d7a302c063c90f2bd20a54",
+      "purpose": "ROCm fp16 prefill waves_per_eu hint",
+      "full_release_update": false
+    }
+  ]
 }

@@ -1,6 +1,6 @@
 # mikenavi Kyojin fleet source
 
-Upstream1.8.0 with native JSON response_format in committed source. Thinking/EOS,
+Upstream 1.8.0 with native JSON response_format in committed source. Thinking/EOS,
 rollback/requeue, independent final validation and literal control-token handling
 are covered by tests/test_native_json.py. No patch application is needed.
 
@@ -18,6 +18,18 @@ incomplete JSON is an error. Ordinary text/tool streams retain upstream behavior
 
 Loop guard: inside a Qwen tool call the answer text/counter rules skip (repeated source paths in a
 result file were cut as a loop); an exact period must hold 2048 tokens. tools/qwen/test_guard.py ToolCallTests.
+
+The reviewed source retains pending tool-call openers across long whitespace
+and splits structured answers using the filter's accepted tokens. Literal
+`</think>` text in reasoning or JSON does not move the reasoning boundary.
+
+The ROCm fp16-prefill hint is backported from upstream commit
+`f5e240c9b990dd8282d7a302c063c90f2bd20a54`. It sets `waves_per_eu=2`
+for head dimensions up to 256; `EXL3_PF_WAVES_PER_EU=0` restores the compiler
+default. This is a selected backport, not the full 1.8.1 release. The GPU
+bit-identity test includes the fleet Qwen geometry (24 query heads, 2 KV heads,
+head dimension 256). A source export or CPU pass does not qualify this JIT
+kernel change on a GPU; the integration candidate needs a separate GPU check.
 
 Update by merging/rebasing upstream into this branch, running regressions and
 publishing a new immutable fleet tag. Deploy exact commit/image digests. A source

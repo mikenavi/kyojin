@@ -16,6 +16,7 @@ device = "cuda:0"
 
 
 @pytest.mark.parametrize("hd, n_heads, n_kv, q_len, past, window", [
+    (256, 24, 2, 4096, 32768, None),
     (256, 24, 4, 4096, 3000, None),
     (256, 24, 4, 1000, 0, None),
     (256, 24, 4, 2500, 777, None),
