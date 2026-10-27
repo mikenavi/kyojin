@@ -83,6 +83,22 @@ class PreparedFormat:
     validator: Any
     filter: Any
 
+    def message(self, text: str, reasoning_first: bool) -> dict:
+        if not reasoning_first:
+            return {"role": "assistant", "content": text}
+        if not self.filter.is_completed():
+            return {"role": "assistant", "content": "", "reasoning_content": text}
+        # Printable tags may also occur in ordinary reasoning or JSON tokens.
+        # The filter journal identifies the accepted JSON suffix unambiguously.
+        content = self.filter.content_text()
+        if not content or not text.endswith(content):
+            raise OutputError("structured output does not match the accepted JSON tokens")
+        prefix = text[:-len(content)]
+        reasoning, sep, whitespace = prefix.rpartition("</think>")
+        if not sep or whitespace.strip():
+            raise OutputError("structured output is missing its reasoning boundary")
+        return {"role": "assistant", "content": whitespace + content, "reasoning_content": reasoning}
+
     def validate(self, message: dict, stats: dict) -> None:
         if not stats.get("structured_complete"):
             raise OutputError("structured output was incomplete; increase max_tokens (no complete JSON answer)")
@@ -166,12 +182,3 @@ def prepare(body: dict, tokenizer: Any, reasoning_first: bool) -> PreparedFormat
     except Exception as exc:
         raise RequestError(f"invalid or unsupported response_format schema: {exc}") from exc
     return PreparedFormat(validator, filt)
-
-
-def message(text: str, reasoning_first: bool) -> dict:
-    """Split only the generation's initial think close, never tags inside JSON strings."""
-    if reasoning_first:
-        reasoning, sep, content = text.partition("</think>")
-        return {"role": "assistant", "content": content if sep else "",
-                "reasoning_content": reasoning}
-    return {"role": "assistant", "content": text}

@@ -16,6 +16,10 @@ tokens without changing vocabulary or EOS IDs. Ordinary text requests retain
 their existing paths. Missing optional validation dependencies return HTTP 503
 for a structured request.
 
+The reasoning boundary follows the accepted token IDs. A literal `</think>`
+written as ordinary text in the reasoning or a JSON string does not split the
+answer.
+
 For example, add this field to a normal chat completion request:
 
 ```json

@@ -6,7 +6,7 @@ import threading
 from functools import lru_cache
 import numpy as np
 import torch
-from .filter import Filter
+from .filter import Filter, FJ_ACCEPT, FJ_COMPLETE
 from .llguidance import LLGuidanceFilter, create_ll_tokenizer
 from llguidance import LLTokenizer, TokenizerWrapper
 from tokenizers import Tokenizer as HFTokenizer
@@ -122,6 +122,17 @@ class ReasoningJSONFilter(Filter):
     def is_completed(self):
         with self._lock:
             return not self._reasoning and self._inner.is_completed()
+
+    def content_text(self) -> str:
+        """Decode completed JSON from accepted tokens, using the actual phase transition."""
+        with self._lock:
+            if not self.is_completed():
+                raise RuntimeError("JSON answer is incomplete")
+            tokens = [token for event, token in self._journal if event in (FJ_ACCEPT, FJ_COMPLETE)]
+            if self._initial_reasoning:
+                tokens = tokens[tokens.index(self.close_id) + 1:]
+            tokens = [token for token in tokens if token not in self._eos]
+            return self._inner._ll_tokenizer.decode_bytes(tokens).decode("utf-8")
 
     # Base Filter.rollback_tokens=False deliberately replays its journal. This
     # restores both phase and matcher correctly when rewinding across </think>.

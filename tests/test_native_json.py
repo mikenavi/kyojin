@@ -287,7 +287,7 @@ class NativeTests(unittest.TestCase):
     def test_final_validation_uses_native_completion_and_preserves_bytes(self):
         p = so.prepare({'response_format': FORMAT}, self.tokenizers[0], False)
         self.feed(p.filter, self.tokenizers[0], TEXT)
-        msg = so.message(TEXT, False)
+        msg = p.message(TEXT, False)
         p.validate(msg, {'structured_complete': True, 'eos_reason': 'max_new_tokens'})
         self.assertEqual(msg['content'], TEXT)
         with self.assertRaises(so.OutputError):
@@ -297,17 +297,45 @@ class NativeTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(so.OutputError):
                 p.validate({'content': text}, {'structured_complete': True})
 
+    def test_message_boundary_survives_rewind_and_job_restart(self):
+        reasoning = 'The literal </think> is ordinary reasoning text.\n'
+        for tokenizer in self.tokenizers:
+            with self.subTest(model=tokenizer.config.architecture):
+                prepared = so.prepare({'response_format': FORMAT}, tokenizer, True)
+                filt = prepared.filter
+                ids = filt._inner._ll_tokenizer.tokenize_str(reasoning)
+                self.assertNotIn(filt.close_id, ids)
+                for token in ids:
+                    filt.feed(token)
+                filt.feed(filt.close_id)
+                answer_ids = self.feed(filt, tokenizer, TEXT)
+                raw = reasoning + '</think>' + TEXT
+                self.assertEqual(prepared.message(raw, True)['content'], TEXT)
+                self.assertEqual(prepared.message(raw, True)['reasoning_content'], reasoning)
+                filt.rewind(len(answer_ids))
+                self.feed(filt, tokenizer, TEXT)
+                self.assertEqual(filt.content_text(), TEXT)
+                filt.restart(False)  # the server inserted the close when recovering a job
+                self.feed(filt, tokenizer, TEXT)
+                message = prepared.message(reasoning + '</think>\n\n' + TEXT, True)
+                self.assertEqual(message['content'], '\n\n' + TEXT)
+                prepared.validate(message, {'structured_complete': True})
+                with self.assertRaises(so.OutputError):
+                    prepared.message(reasoning + '</think>' + TEXT + ' unexpected', True)
+
 
 class FakeEngine:
     ctx = 20000
     supports_vision = False
     spec_on = True
 
-    def __init__(self, tokenizer, output=None, *, complete=True, eos='end_filter', sessions=1, error=False):
+    def __init__(self, tokenizer, output=None, *, complete=True, eos='end_filter', sessions=1, error=False,
+                 reasoning='Мысль.'):
         self.tokenizer, self.output = tokenizer, output
         self.complete, self.eos = complete, eos
         self.calls, self.last_stats = [], {}
         self.sessions, self.error = sessions, error
+        self.reasoning = reasoning
 
     def prompt_ids(self, prompt):
         return self.tokenizer.encode(prompt, encode_special_tokens=True, add_bos=False)
@@ -321,15 +349,16 @@ class FakeEngine:
     async def generate(self, prompt, **kw):
         self.calls.append(kw)
         structured = kw.get('structured')
-        raw = ('Мысль.</think>' if prompt.rstrip().endswith('<think>') else '')
-        raw += self.output if self.output is not None else TEXT
+        reasoning = self.reasoning if prompt.rstrip().endswith('<think>') else None
+        answer = self.output if self.output is not None else TEXT
+        raw = (reasoning + '</think>' if reasoning is not None else '') + answer
         if structured is not None and self.complete:
-            prefix, sep, answer = raw.partition('</think>')
-            if sep:
-                ids = self.tokenizer.encode(prefix + sep, encode_special_tokens=True, add_bos=False).flatten().tolist()
-                ids += structured.filter._inner._ll_tokenizer.tokenize_str(answer)
-            else:
-                ids = structured.filter._inner._ll_tokenizer.tokenize_str(raw)
+            ids = []
+            if reasoning is not None:
+                ids = structured.filter._inner._ll_tokenizer.tokenize_str(reasoning)
+                assert structured.filter.close_id not in ids
+                ids.append(structured.filter.close_id)
+            ids += structured.filter._inner._ll_tokenizer.tokenize_str(answer)
             for token in ids:
                 structured.filter.feed(token)
         if self.error:
@@ -350,12 +379,14 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         cls.t = Tokenizer(Config.from_directory(os.environ['QWEN_JSON_MODEL']))
         cls.g = Tokenizer(Config.from_directory(os.environ['GLM_JSON_MODEL']))
 
-    async def request(self, server, tokenizer, *, extra=None, output=None, complete=True, eos='end_filter', sessions=1, error=False):
+    async def request(self, server, tokenizer, *, extra=None, output=None, complete=True, eos='end_filter', sessions=1,
+                      error=False, reasoning='Мысль.', template=TEMPLATE):
         from aiohttp.test_utils import TestClient, TestServer
-        engine = FakeEngine(tokenizer, output, complete=complete, eos=eos, sessions=sessions, error=error)
+        engine = FakeEngine(tokenizer, output, complete=complete, eos=eos, sessions=sessions, error=error,
+                            reasoning=reasoning)
         defaults = dict(QWEN.load_defaults('/nonexistent'), reasoning_effort=None)
-        app = (server.create_app(engine, 'm', TEMPLATE, defaults=defaults) if server is QWEN else
-               server.create_app(engine, 'm', TEMPLATE))
+        app = (server.create_app(engine, 'm', template, defaults=defaults) if server is QWEN else
+               server.create_app(engine, 'm', template))
         async with TestClient(TestServer(app)) as client:
             body = {'model': 'm', 'messages': [{'role': 'user', 'content': 'Верни JSON'}], 'max_tokens': 1000,
                     'response_format': FORMAT}
@@ -384,6 +415,68 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(content, TEXT)
                             self.assertEqual(frames[-1]['choices'][0]['finish_reason'], 'stop')
                             self.assertIn('data: [DONE]', text)
+
+    async def test_literal_reasoning_tags_do_not_split_the_json_answer(self):
+        reasoning = 'The literal </think> is ordinary text here. <think> is another example.\n'
+        for server, tokenizer in ((QWEN, self.t), (GLM, self.g)):
+            for stream in (False, True):
+                for sessions in (1, 2):
+                    with self.subTest(server=server.__name__, stream=stream, sessions=sessions):
+                        status, _, text, _ = await self.request(server, tokenizer, extra={'stream': stream},
+                                                               sessions=sessions, reasoning=reasoning)
+                        self.assertEqual(status, 200, text)
+                        if not stream:
+                            message = json.loads(text)['choices'][0]['message']
+                            self.assertEqual(message['content'], TEXT)
+                            self.assertEqual(message['reasoning_content'], reasoning)
+                        else:
+                            frames = [json.loads(x[6:]) for x in text.splitlines() if x.startswith('data: {')]
+                            self.assertFalse(any('error' in x for x in frames), text)
+                            for field, expected in (('content', TEXT), ('reasoning_content', reasoning)):
+                                self.assertEqual(''.join(x['choices'][0]['delta'].get(field, '') for x in frames), expected)
+                            self.assertEqual(frames[-1]['choices'][0]['finish_reason'], 'stop')
+
+    async def test_json_without_reasoning_preserves_literal_tags(self):
+        for server, tokenizer in ((QWEN, self.t), (GLM, self.g)):
+            for stream in (False, True):
+                with self.subTest(server=server.__name__, stream=stream):
+                    status, _, text, _ = await self.request(server, tokenizer, extra={'stream': stream},
+                                                           template=TEMPLATE.replace('<think>', ''))
+                    self.assertEqual(status, 200, text)
+                    if not stream:
+                        self.assertEqual(json.loads(text)['choices'][0]['message']['content'], TEXT)
+                    else:
+                        frames = [json.loads(x[6:]) for x in text.splitlines() if x.startswith('data: {')]
+                        self.assertFalse(any('error' in x for x in frames), text)
+                        self.assertEqual(''.join(x['choices'][0]['delta'].get('content', '') for x in frames), TEXT)
+
+    async def test_text_mismatching_accepted_tokens_is_an_output_error(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        class MismatchedEngine(FakeEngine):
+            async def generate(self, prompt, **kw):
+                async for piece in super().generate(prompt, **kw):
+                    yield piece
+                yield ' unexpected'
+        for server, tokenizer in ((QWEN, self.t), (GLM, self.g)):
+            for stream in (False, True):
+                with self.subTest(server=server.__name__, stream=stream):
+                    engine = MismatchedEngine(tokenizer)
+                    app = (server.create_app(engine, 'm', TEMPLATE,
+                           defaults=dict(QWEN.load_defaults('/nonexistent'), reasoning_effort=None)) if server is QWEN else
+                           server.create_app(engine, 'm', TEMPLATE))
+                    async with TestClient(TestServer(app)) as client:
+                        response = await client.post('/v1/chat/completions', json={
+                            'model': 'm', 'messages': [{'role': 'user', 'content': 'JSON'}],
+                            'response_format': FORMAT, 'max_tokens': 1000, 'stream': stream})
+                        text = await response.text()
+                        if not stream:
+                            self.assertEqual(response.status, 502, text)
+                        else:
+                            frames = [json.loads(x[6:]) for x in text.splitlines() if x.startswith('data: {')]
+                            reasons = [x['choices'][0]['finish_reason'] for x in frames if 'choices' in x]
+                            self.assertIn('error', reasons)
+                            self.assertNotIn('stop', reasons)
+                        self.assertIn('does not match', text)
 
     async def test_incomplete_or_failure_is_never_announced_success(self):
         for server, tokenizer in ((QWEN, self.t), (GLM, self.g)):
