@@ -22,3 +22,35 @@ result file were cut as a loop); an exact period must hold 2048 tokens. tools/qw
 Update by merging/rebasing upstream into this branch, running regressions and
 publishing a new immutable fleet tag. Deploy exact commit/image digests. A source
 export does not qualify a new compiler, GPU backend or long-context workload.
+
+Qwen attachment spill: `KYOJIN_ATTACHMENT_CACHE_DIR` opts into exact, bounded
+disk storage independent of the stock 32-entry / 1 GiB RAM embedding cache.
+`KYOJIN_ATTACHMENT_CACHE_BYTES` (default 4 GiB) and
+`KYOJIN_ATTACHMENT_CACHE_ITEMS` (default 16384) must be positive. The store
+retains token IDs, rows, deepstack, MRoPE and occurrence identity across RAM
+eviction. Corrupt/missing/unadmitted entries get fresh IDs and normal prefill.
+A private exclusive directory lease scopes identities to one engine lifetime;
+stale spill files are removed on startup, and concurrent owners fall back to RAM.
+This does not restore multimodal identities from persisted KV slots after restart.
+The directory contains derived attachment data, not a conversation archive.
+The full request still holds its embedding rows; cache limits are not peak request
+RAM limits. Per-request vision builds and cumulative disk counters are logged.
+Run `tools/qwen/test_attachment_cache.py` without GPU, setting QWEN_JSON_MODEL
+to a tokenizer/config fixture for the real tokenization gate.
+
+For an explicitly reserved idle GPU server, run
+`python tools/qwen/test_attachment_cache_gpu.py --model MODEL_ID --output RECEIPTS`.
+It sends real vision requests; it does not load or switch the server. Use
+`--baseline` against the parent and a different output directory against the
+candidate. Optional credentials come from `KYOJIN_TEST_API_KEY`; receipts contain
+test requests and replies, never the authorization header. The parent must show
+cache loss; the candidate must reuse the prefix, match forced-cold answers,
+recognize changed image content, and preserve repeated occurrences.
+
+On 2026-10-27, the Qwen3.8 Flash Next EXL3 / gfx1151 / MTP build passed all seven
+candidate vision checks and eleven short JSON/text/tool regressions. In one
+129-image comparison, the parent's repeat reused 0 of 9893 prompt tokens
+(8.750 s); the candidate reused 9728 tokens (0.570 s), with zero vision builds
+on repeat. This is a targeted cache regression, not a workload speed guarantee
+or a new 512K quality qualification. CPU checks passed 174 tests with one upstream
+template fixture skip. The exact native SDK/ELF and JSON dependencies were retained.

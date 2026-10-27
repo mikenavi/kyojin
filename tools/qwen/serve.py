@@ -42,6 +42,7 @@ sys.path.insert(0, str(HERE))
 sys.path.append(str(HERE.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 import image_cache  # noqa: E402  (shared bounded LRU of image embeddings; symlink to tools/strix_halo)
+from attachment_cache import make_image_cache  # lossless disk spill, separate from RAM residency
 import structured_output  # shared native JSON request contract
 import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /tokenize, usage details)
 from l21_prompt_encode_cache import PromptEncodeCache  # noqa: E402  (incremental prompt encode)
@@ -803,7 +804,7 @@ class QwenEngine:
             with Heartbeat("loading MTP drafter"):
                 self.draft_model.load(progressbar=False, callback=startup_health.load_callback())
         self.vision = None
-        self.emb_cache = image_cache.ImageEmbeddingCache()
+        self.emb_cache = make_image_cache()
         if vision:
             try:
                 self.vision = Model.from_config(self.config, component="vision")
@@ -1011,14 +1012,23 @@ class QwenEngine:
                             min_p=s.get("min_p", 0.0))
 
     def _embed(self, images: list[tuple[Any, str]]) -> list:
-        """One MMEmbedding per image. The same bytes give the same embedding object (same pseudo token ids), so a
-        history turn that repeats an image still matches the paged KV cache (see image_cache.py)."""
+        """One MMEmbedding per occurrence, retaining its pseudo token IDs across RAM eviction when backed."""
+        backing = getattr(self.emb_cache, "backing", None)
+        builds = 0
         def build(image):
+            nonlocal builds
+            builds += 1
             t0 = time.perf_counter()
             emb = self.vision.get_image_embeddings(tokenizer=self.tokenizer, image=image)
             print(f"qserve: image {image.size[0]}x{image.size[1]} -> {emb.mm_length} tokens, tower {(time.perf_counter() - t0) * 1000:.0f} ms", flush=True)
             return emb
-        return self.emb_cache.get_many(images, build)
+        out = self.emb_cache.get_many(images, build)
+        if backing is not None and images:
+            counts = " ".join(f"{k}_total={v}" for k, v in backing.stats.items())
+            print(f"qserve: attachment-cache images={len(images)} vision_builds={builds} {counts} "
+                  f"ram_items={len(self.emb_cache)} ram_mib={self.emb_cache.nbytes / 2**20:.1f} "
+                  f"disk_mib={backing.nbytes / 2**20:.1f}", flush=True)
+        return out
 
     def _encode(self, prompt: str, image_urls: list[str]):
         embs = self._embed([load_image_keyed(url) for url in image_urls]) if image_urls else []
