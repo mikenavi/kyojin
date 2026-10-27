@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "upstream": "https://github.com/Yamz-Labs/kyojin",
+  "upstream_base": "e2f37564bbae01a6ea8ad4176dfd97db09c253aa",
+  "component": "kyojin",
+  "product_files": {
+    "tools/qwen/serve.py": "46703b2bf88f1b412d2cf08aae3b90907a8690e031ebb3c52cbafa0e57a697ca",
+    "tools/glm/serve.py": "969a479e57f99f9f7b261a33e390a180e2c6a35f6a0c71cdd6609b24e90d33a6",
+    "tools/structured_output.py": "1432716dd08ea65cf5c85d1dbc089be9911a887a07047f03e0037c44391f60ae",
+    "exllamav3/generator/filter/structured.py": "81304055f9f3b7cd5fe4962ca6f609d7e6711284b3965e4ff6c281f51f94e0c2",
+    "exllamav3/generator/filter/llguidance.py": "4ee542214b794dd30e00d8b51d68a456931a2b57ac1e745c3c317c710589caf1",
+    "tools/loopguard.py": "b9e8a9479fe9769e406d9a8810c15fa886a34648ab3a50f7c662515245e31e23",
+    "tools/qwen/attachment_cache.py": "a36f9c4f52bc987b4a218c621d64f623774d7c8264088797b9e44bb34eacc3a9",
+    "tools/strix_halo/image_cache.py": "7bf52cc1a25e1a909e9c659f362d1ea96b278c60c948137cdbc5336f20d51b77",
+    "exllamav3/modules/attention_fn/triton_paged.py": "3209f80a742ae20ebb3511bf997d190fa22881d17aaae3cc4dec59dc42602a4f"
+  },
+  "source_only_export": true,
+  "target": "Linux gfx1151 with an external pinned ROCm toolchain",
+  "qualification": "Upstream main (1.8.2) with a merge of each feature branch; the fp16-prefill hint is now upstream. Feature branches passed their CPU/API tests; GPU validation and activation of this source are separate and pending.",
+  "upstream_backports": []
+}

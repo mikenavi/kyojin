@@ -1,3 +1,5 @@
+> **mikenavi fleet fork:** see [README.fleet.md](README.fleet.md) for the pinned component, local changes, build and qualification limits.
+
 <p align="center"><img src="assets/yamz-banner.svg" alt="Yamz" width="640"></p>
 
 <p align="center">
