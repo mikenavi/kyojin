@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int); ap.add_argument("-c", type=int); ap.add_argument("--sessions", type=int, default=1)
 ap.add_argument("--model"); ap.add_argument("--model-id"); ap.add_argument("--k-bits"); ap.add_argument("--v-bits"); ap.add_argument("--draft-policy")
+ap.add_argument("--kv-mode"); ap.add_argument("--kvwin")
 ap.add_argument("--no-vision", action="store_true"); ap.add_argument("--chat-template")
 a = ap.parse_args()
 LIMIT = int(os.environ.get("LIMIT", "50000"))
@@ -40,4 +41,6 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(b"data: " + json.dumps({"choices": [], "usage": {"prompt_tokens": pt, "completion_tokens": min(mt, 20)}}).encode() + b"\n\ndata: [DONE]\n\n")
 
 
-ThreadingHTTPServer(("127.0.0.1", a.port), H).serve_forever()
+srv = ThreadingHTTPServer(("127.0.0.1", a.port), H)
+print(f"qserve: READY on http://127.0.0.1:{a.port}  model=fake", flush=True)
+srv.serve_forever()

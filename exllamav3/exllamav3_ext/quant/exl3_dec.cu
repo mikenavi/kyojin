@@ -667,11 +667,10 @@ __device__ __forceinline__ void block_reduce(const float* acc, float* red, float
     __syncthreads();
 }
 
-// Cross-block k reduction: store this block's z to scratch, count arrivals; returns true in the
-// last arriving block (for this counter), which then holds nothing yet (caller sums partials).
-__device__ __forceinline__ bool arrive(const float* z, float* part, int ncols, int* counter, int target, int tid)
+// Cross-block arrival only (the caller has already stored its partials): fence, count, and return
+// true in the last arriving block (which then resets the counter for the next launch).
+__device__ __forceinline__ bool arrive_count(int* counter, int target, int tid)
 {
-    for (int col = tid; col < ncols; col += THREADS) part[col] = z[col];
     __threadfence();
     __syncthreads();
     __shared__ int s_last;
@@ -685,6 +684,14 @@ __device__ __forceinline__ bool arrive(const float* z, float* part, int ncols, i
     if (!s_last) return false;
     __threadfence();
     return true;
+}
+
+// Cross-block k reduction: store this block's z to scratch, count arrivals; returns true in the
+// last arriving block (for this counter), which then holds nothing yet (caller sums partials).
+__device__ __forceinline__ bool arrive(const float* z, float* part, int ncols, int* counter, int target, int tid)
+{
+    for (int col = tid; col < ncols; col += THREADS) part[col] = z[col];
+    return arrive_count(counter, target, tid);
 }
 
 // Ragged k split: the k extent is G groups of 8 tiles (128 inputs); block kb of kbs takes groups
@@ -2056,6 +2063,19 @@ inline int kb2_of(double K)
     return kb2;
 }
 
+// Keep the routed-MoE formats unchanged. K8 is an opt-in dense mul1 experiment.
+inline int dense_kb2_of(double K, bool mcg)
+{
+    if (K == 8.0)
+    {
+        const char* enabled = getenv("EXL3_DENSE_K8");
+        TORCH_CHECK(enabled && enabled[0] == '1' && enabled[1] == '\0' && !mcg,
+                    "exl3_dec: dense K8 requires mul1 and EXL3_DENSE_K8=1");
+        return 16;
+    }
+    return kb2_of(K);
+}
+
 #define EXL3_DEC_DISPATCH_KB2(kb2, ...)                                             \
     switch (kb2)                                                                     \
     {                                                                                \
@@ -2094,6 +2114,12 @@ inline void launch_gemv_cb(int kb2, int blocks, const half* xp, const Jobs& jobs
         case 10: gemv_kernel<10, CB><<<blocks, THREADS, 0, stream>>>(xp, jobs, sp, cp); break;
         case 12: gemv_kernel<12, CB><<<blocks, THREADS, 0, stream>>>(xp, jobs, sp, cp); break;
         case 14: gemv_kernel<14, CB><<<blocks, THREADS, 0, stream>>>(xp, jobs, sp, cp); break;
+        case 16:
+            if constexpr (CB == 2)
+                gemv_kernel<16, 2><<<blocks, THREADS, 0, stream>>>(xp, jobs, sp, cp);
+            else
+                TORCH_CHECK(false, "exl3_dec_gemv: K8 requires mul1");
+            break;
         default: TORCH_CHECK(false, "exl3_dec_gemv: unsupported K*2 ", kb2);
     }
 }
@@ -2258,7 +2284,7 @@ static void dec_gemv_impl
                               : x.numel() == x.size(-1), "exl3_dec_gemv: x must be fp16 [1, K] (or cover the strided groups)");
     }
     TORCH_CHECK(Kdim % 512 == 0, "exl3_dec_gemv: K must be a multiple of 512");
-    const int kb2 = kb2_of(K[0]);
+    const int kb2 = dense_kb2_of(K[0], mcg);
     int strips_total = 0;
     for (int i = 0; i < n; ++i) strips_total += (out[i].size(-1) + STRIP - 1) / STRIP;
     const int min_blocks = env_int("EXL3_DEC_MIN_BLOCKS", 32);
@@ -2276,7 +2302,7 @@ static void dec_gemv_impl
     int blocks = 0, part = 0, ctr = CTR_GEMV;
     for (int i = 0; i < n; ++i)
     {
-        TORCH_CHECK(kb2_of(K[i]) == kb2, "exl3_dec_gemv: all matrices must share K");
+        TORCH_CHECK(dense_kb2_of(K[i], mcg) == kb2, "exl3_dec_gemv: all matrices must share K");
         const int N = out[i].size(-1);
         TORCH_CHECK(N % 128 == 0 && out[i].numel() == N && out[i].is_contiguous(), "exl3_dec_gemv: out must be [1, N], N % 128 == 0");
         TORCH_CHECK(trellis[i].size(0) == Kdim / 16 && trellis[i].size(1) == N / 16 && trellis[i].size(2) == kb2 * 8,
@@ -2413,7 +2439,36 @@ struct JobsR
     int rpb;             // rows per block (chunk size); grid.y = ceil(R / rpb)
     int swap;            // 1: grid = (row chunks, blocks), so the chunks of one weight block run side by side and share its reads
     int x_row_pitch;      // half-elements between consecutive rows of x (K for contiguous x)
+    int arr1;            // 1: one cross-block arrival per block for all its rows (see gemv_kernel_r), else one per row
 };
+
+// Output rotation (Hadamard + svh scale) and store of one row's reduced strip from the LDS z (waves 0-3).
+__device__ __forceinline__ void rotate_store_row(const float* z, const JobR& job, int col0, int ncols, int row, int wave, int lane)
+{
+    if (wave >= 4 || wave * 128 >= ncols) return;
+    float v[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = z[wave * 128 + lane * 4 + i];
+    const int col = col0 + wave * 128 + lane * 4;
+#if !defined(EXL3_DEC_DEBUG)
+    fwht128(v, lane);
+    const uint2 sr = *reinterpret_cast<const uint2*>(job.svh + col);
+    const half* sh = reinterpret_cast<const half*>(&sr);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] *= HAD_SCALE * __half2float(sh[i]);
+#endif
+    if (job.out_fp32)
+        *reinterpret_cast<float4*>(reinterpret_cast<float*>(job.out) + (size_t) row * job.N + col) =
+            make_float4(v[0], v[1], v[2], v[3]);
+    else
+    {
+        half o[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) o[i] = sat_half(v[i]);
+        *reinterpret_cast<uint2*>(reinterpret_cast<half*>(job.out) + (size_t) row * job.N + col) =
+            *reinterpret_cast<uint2*>(o);
+    }
+}
 
 constexpr int GEMV_R_ROW_BUDGET = MOE_R_MAX * MOE_R_KTW_MAX;   // 128: max rpb * ktw
 // Rows per exl3_dec_gemv_r call. One block still holds at most MOE_R_MAX rows (LDS staging, accumulators); rows beyond that run as
@@ -2518,6 +2573,40 @@ void gemv_kernel_r(const half* __restrict__ x, JobsR jobs, float* scratch, int* 
 
     const int col0 = strip * STRIP;
     const int ncols = min(STRIP, job.N - col0);
+    if (jobs.arr1 && jobs.kbs > 1)
+    {
+        // One arrival for every row this block carries: rows differ only in their partial buffers,
+        // so a single fence + atomic (target kbs) replaces one serialized arrival per row. Per-row
+        // reduction order (kb index order) and rotation are unchanged.
+        // The slot is the counter of this block's OWN row chunk (row0), never a fixed row 0: with
+        // grid.y = nch row chunks the chunks run concurrently and each must open its own barrier
+        // after its kbs blocks arrived. Sharing one slot across chunks made the target reach early
+        // and reduced a partially written partial buffer (Qwen27 HIP 7-8 row verify: 3/3 distinct
+        // logits md5 per arm, 2026-10-28).
+        #pragma unroll
+        for (int j = 0; j < RM; ++j)
+        {
+            if (j >= nrows) break;
+            float xsum = 0.0f;
+            for (int c = 0; c < ktw; ++c) xsum += s_xsum[j][c];
+            block_reduce<CB>(acc[j], red, z, xsum, wave, lane, tid);
+            float* part = scratch + job.part_base + (size_t) (row0 + j) * jobs.kbs * job.N + (size_t) kb * job.N + col0;
+            for (int col = tid; col < ncols; col += THREADS) part[col] = z[col];
+        }
+        if (!arrive_count(counters + job.ctr_base + row0 * job.strips + strip, jobs.kbs, tid)) return;
+        #pragma unroll
+        for (int j = 0; j < RM; ++j)
+        {
+            if (j >= nrows) break;
+            const int row = row0 + j;
+            const float* p = scratch + job.part_base + (size_t) row * jobs.kbs * job.N + col0;
+            for (int col = tid; col < ncols; col += THREADS) z[col] = sum_coherent(p + col, job.N, jobs.kbs);
+            __syncthreads();
+            rotate_store_row(z, job, col0, ncols, row, wave, lane);
+            __syncthreads();
+        }
+        return;
+    }
     #pragma unroll
     for (int j = 0; j < RM; ++j)
     {
@@ -2541,31 +2630,7 @@ void gemv_kernel_r(const half* __restrict__ x, JobsR jobs, float* scratch, int* 
             __syncthreads();
         }
 
-        if (wave < 4 && wave * 128 < ncols)
-        {
-            float v[4];
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) v[i] = z[wave * 128 + lane * 4 + i];
-            const int col = col0 + wave * 128 + lane * 4;
-#if !defined(EXL3_DEC_DEBUG)
-            fwht128(v, lane);
-            const uint2 sr = *reinterpret_cast<const uint2*>(job.svh + col);
-            const half* sh = reinterpret_cast<const half*>(&sr);
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) v[i] *= HAD_SCALE * __half2float(sh[i]);
-#endif
-            if (job.out_fp32)
-                *reinterpret_cast<float4*>(reinterpret_cast<float*>(job.out) + (size_t) row * job.N + col) =
-                    make_float4(v[0], v[1], v[2], v[3]);
-            else
-            {
-                half o[4];
-                #pragma unroll
-                for (int i = 0; i < 4; ++i) o[i] = sat_half(v[i]);
-                *reinterpret_cast<uint2*>(reinterpret_cast<half*>(job.out) + (size_t) row * job.N + col) =
-                    *reinterpret_cast<uint2*>(o);
-            }
-        }
+        rotate_store_row(z, job, col0, ncols, row, wave, lane);
         if (jobs.kbs > 1) __syncthreads();
     }
 }
@@ -2592,7 +2657,7 @@ static void dec_gemv_r_impl
     const int Kdim = (int) x.size(1);
     TORCH_CHECK(R >= 1 && R <= GEMV_R_MAX_ROWS, "exl3_dec_gemv_r: R must be 1..GEMV_R_MAX_ROWS");
     TORCH_CHECK(Kdim % 512 == 0, "exl3_dec_gemv_r: K must be a multiple of 512");
-    const int kb2 = kb2_of(K[0]);
+    const int kb2 = dense_kb2_of(K[0], mcg);
     int strips_total = 0;
     for (int i = 0; i < n; ++i) strips_total += ((int) out[i].size(-1) + STRIP - 1) / STRIP;
     // Identical to dec_gemv_impl's own ktw/kbs choice (same pick_ktw/kbs_of call, same args) --
@@ -2638,11 +2703,17 @@ static void dec_gemv_r_impl
     // 5..8 rows only (the <= 4 row launches keep their grid); 9..32 rows swap by default (EXL3_GEMV_R_SWAP9=0 restores the plain grid):
     // the chunks of one weight block then run side by side and share its reads through L2 instead of re-streaming the weights per chunk
     jobs.swap = (env_int("EXL3_GEMV_R_CHUNK_FAST", 0) != 0 || (R > MOE_R_MAX && env_int("EXL3_GEMV_R_SWAP9", 1) != 0)) && R > 4 && R > rpb;
+    // EXL3_GEMV_R_ARR1 (default 1): one cross-block arrival per block instead of one per row (one fence + one atomic for
+    // all the rows a block carries). Sound for any chunking because the counter slot is the block's own row chunk
+    // (kernel: ctr_base + row0 * strips + strip): each chunk opens its own barrier after exactly its kbs blocks arrived.
+    // The earlier row-0-only slot was racy once a job ran more than one chunk (7..8 row verify, 9..32 row MoE rows:
+    // repeated runs gave different logits). Per-row reduction order is untouched, so output is bit-identical to ARR1=0.
+    jobs.arr1 = env_int("EXL3_GEMV_R_ARR1", 1) != 0;
     jobs.x_row_pitch = Kdim;
     int blocks = 0, part = 0, ctr = 0;
     for (int i = 0; i < n; ++i)
     {
-        TORCH_CHECK(kb2_of(K[i]) == kb2, "exl3_dec_gemv_r: all matrices must share K");
+        TORCH_CHECK(dense_kb2_of(K[i], mcg) == kb2, "exl3_dec_gemv_r: all matrices must share K");
         const int N = (int) out[i].size(-1);
         TORCH_CHECK(N % 128 == 0 && out[i].size(0) == R && out[i].is_contiguous(),
                     "exl3_dec_gemv_r: out must be [R, N], N % 128 == 0");
@@ -2678,6 +2749,18 @@ static void dec_gemv_r_impl
         {
             if (kb2 == 8) { auto kfn = gemv_kernel_r<8, CB, 6, 1>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
             else          { auto kfn = gemv_kernel_r<10, CB, 6, 1>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
+        });
+        cuda_check(cudaPeekAtLastError());
+        return;
+    }
+    if (kb2 == 16)
+    {
+        EXL3_DEC_DISPATCH_RM(rpb,
+        {
+            if (RM > 1 && env_int("EXL3_GEMV_R_DEC1", 0) == 1)
+            { auto kfn = gemv_kernel_r<16, 2, RM, 1>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
+            else
+            { auto kfn = gemv_kernel_r<16, 2, RM>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
         });
         cuda_check(cudaPeekAtLastError());
         return;
