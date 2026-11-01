@@ -88,3 +88,7 @@ could bypass the disk quota. Both are covered by regressions. The final reviewed
 payload passed all 19 attachment tests and repeated the seven GPU cache checks
 plus eleven short regressions. Its 129-image repeat reused 9728 of 9893 tokens
 (0.576 s wall); no vision re-encoding was needed.
+
+## November 1: 1.8.3 source update
+
+Each existing contribution branch merges upstream main `03654935b84e0f68567a442dafda7e067a361818` (v1.8.3 plus startup diagnostics). The fleet merges upstream and those branches; no historical patch stack is applied. Native inputs changed, so the extension must be rebuilt. JSON, tool loop guard and bounded attachment spill remain required. Existing 512K/RoPE, media and isolation settings belong to deployment; this source update does not change them. CPU/native/GPU qualification is recorded separately.
