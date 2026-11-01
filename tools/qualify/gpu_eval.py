@@ -80,10 +80,12 @@ def kv(pack, docs, ref, out, bits):
     json.dump(res, open(out, "w"), indent=1)
 
 
-def kvmode(pack, docs, out, n=256):
+def kvmode(pack, docs, out, n=256, only=None):
     """Prefill ids[:T-n] in 2048-row chunks (quantize-on-write, the KVWIN ring bound for the tq formats), then n teacher-forced decode steps
     through the engine's own decode path, once per KV format; KL of each format's log-probs against k8v8's. No BF16 reference needed.
-    One model load per format: a 33B pack on a 24 GB card has no room for several 32K caches at once."""
+    One model load per format: a 33B pack on a 24 GB card has no room for several 32K caches at once.
+    `only` = one format name: measure just that one (the stage takes the GPU lock per format so no hold exceeds one load + one 32K pass); the k8v8
+    log-probs are kept in <out>.k8v8.pt for the others and the result json is merged."""
     import os
     from exllamav3 import Cache, CacheLayer_quant, Config, Model
     from exllamav3.cache import tq
@@ -92,12 +94,20 @@ def kvmode(pack, docs, out, n=256):
     e = T - n
     cfg = Config.from_directory(pack)
     hd = cfg.head_dim
+    if hd <= 0 or getattr(cfg, 'kv_lora_rank', 0):
+        hd = getattr(cfg, 'kv_lora_rank', hd)       # MLA: the cached vector is the latent
     fmts = [("k8v8", "quant", 8), ("k6v6", "quant", 6), ("kw6", "quant", 6)] + [(f"tq{b}", "tq", b) for b in (6, 5) if hd > 0 and tq.supported(hd, b)]
     x = torch.tensor([ids])
     npg = (T + 256) // 256
     bt = torch.arange(npg, dtype=torch.int32)[None]
     res, lps = {}, {}
+    if os.path.exists(out):
+        res = json.load(open(out))
+    if os.path.exists(out + ".k8v8.pt"):
+        lps["k8v8"] = torch.load(out + ".k8v8.pt").float()
     for name, kind, b in fmts:
+        if only and name != only:
+            continue
         m = Model.from_config(Config.from_directory(pack))
         os.environ.pop("EXL3_KVWIN", None)
         if kind == "tq":
@@ -106,6 +116,11 @@ def kvmode(pack, docs, out, n=256):
             os.environ["EXL3_KVWIN"] = "4:128" if name == "kw6" else "0"     # the production formats at >= 6 bits run without the window; kw6 = the same cache with the ring
             cache = Cache(m, max_num_tokens=T + 256, max_batch_size=2, max_history=3, layer_type=CacheLayer_quant, k_bits=b, v_bits=b)
             os.environ.pop("EXL3_KVWIN")
+        if kind == "tq" and not tq.cache_is_tq(cache):
+            res[name] = dict(unsupported="the attention cache layers of this model do not take a TurboQuant cache (no TurboQuant layer for this attention type)")
+            print(name, res[name], flush=True)
+            del cache, m; gc.collect()
+            continue
         m.load(progressbar=False)
         with torch.inference_mode():
             st = cache.get_new_state() if cache.recurrent_state_cls is not None else None
@@ -118,13 +133,17 @@ def kvmode(pack, docs, out, n=256):
                 m.prefill(x[:, a: min(a + 2048, e)], par(a, min(a + 2048, e) - a))
             rows = []
             t_dec = time.time()
-            for j in range(n):
-                lg = m.forward(x[:, e + j: e + j + 1], par(e + j, 1))
-                rows.append(torch.log_softmax(lg.float().reshape(-1, lg.shape[-1])[-1], -1).half().cpu())
+            qs = int(os.environ.get("KVMODE_QS", "1"))        # rows per decode step: >1 exercises the verify path (spec / MTP / parallel users)
+            for j in range(0, n, qs):
+                k = min(qs, n - j)
+                lg = m.forward(x[:, e + j: e + j + k], par(e + j, k))
+                rows.append(torch.log_softmax(lg.float().reshape(-1, lg.shape[-1])[-k:], -1).half().cpu())
             t_dec = (time.time() - t_dec) / n
             if st is not None:
                 st.free()
-        lps[name] = torch.stack(rows).float()
+        lps[name] = torch.cat(rows).float()
+        if name == "k8v8":
+            torch.save(lps[name], out + ".k8v8.pt")
         free(m, cache)
         if name != "k8v8":
             r8 = lps["k8v8"]
@@ -142,4 +161,4 @@ if __name__ == "__main__":
     elif cmd == "kv":
         kv(*sys.argv[2:6], [int(x) for x in sys.argv[6:]])
     elif cmd == "kvmode":
-        kvmode(*sys.argv[2:5], *[int(x) for x in sys.argv[5:6]])
+        kvmode(*sys.argv[2:5], *[int(x) for x in sys.argv[5:6]], only=sys.argv[6] if len(sys.argv) > 6 else None)

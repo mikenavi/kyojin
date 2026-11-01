@@ -19,6 +19,9 @@ from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_at
 _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
 _shared_proj = os.environ.get("EXL3_ATTN_SHARED_PROJ", "1") != "0"
 _shared_check = os.environ.get("EXL3_ATTN_SHARED_CHECK", "0") != "0"
+# EXL3_ATTN_BATCH_QSA (default on): in the row-invariant multi-job step, when every sequence takes the sparse (QSA) path the plane update, the KV append and
+# the gathered attention launch once over all sequences (their kernels give each row the bits of the one-sequence launch); the selection stays per sequence
+_batch_qsa = os.environ.get("EXL3_ATTN_BATCH_QSA", "1") != "0"
 _SHARED_STATS = [0, 0]
 _QKV_IG_MULTI = os.environ.get("EXL3_ATTN_QKV_IG_MULTI", "1") != "0"   # (q|gate, k, v one launch)
 
@@ -1184,7 +1187,7 @@ class Attention(Module):
         return o
 
 
-    def bc_attn_step(self, x, cache, params, block_table, cache_seqlens, host_seqlens = None):
+    def bc_attn_step(self, x, cache, params, block_table, cache_seqlens, host_seqlens = None, kvwin_ctx = None):
         """
         Graph-captured decode attention block (projections through o_proj as one C++ call,
         replayed as one CUDA graph after warmup). Returns the block output, or None when the
@@ -1210,7 +1213,7 @@ class Attention(Module):
             return None
         return bca.step(
             x, cache_seqlens, block_table, position, positions, position_ids, inv_freq,
-            causal = params.get("causal", True), host_seqlens = host_seqlens
+            causal = params.get("causal", True), host_seqlens = host_seqlens, kvwin_ctx = kvwin_ctx
         )
 
 
@@ -1221,7 +1224,10 @@ class Attention(Module):
             return default, kwargs
         from ..cache.fp16 import CacheLayer_fp16
         from ..cache.quant import CacheLayer_quant
-        from ..cache.qsa import CacheLayer_qsa, CacheLayer_qsa_quant
+        from ..cache.qsa import CacheLayer_qsa, CacheLayer_qsa_quant, CacheLayer_qsa_tq
+        from ..cache.tq import CacheLayer_tq
+        if issubclass(default, CacheLayer_tq):
+            return CacheLayer_qsa_tq, kwargs
         if issubclass(default, CacheLayer_quant):
             return CacheLayer_qsa_quant, kwargs
         assert issubclass(default, CacheLayer_fp16), \
@@ -1338,7 +1344,7 @@ class Attention(Module):
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
         ):
             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens,
-                                  host_seqlens = qsa_seqlens_cpu)
+                                  host_seqlens = qsa_seqlens_cpu, kvwin_ctx = ov)
             if o is not None:
                 return o
 
@@ -1376,7 +1382,7 @@ class Attention(Module):
             _sim_kvq_inplace(v, simulate_kv_quant[1], sq_ca)
 
         if qsa_sparse:
-            qsa_layer.update_kv_direct(cache_seqlens, block_table, k, v, seqlen)
+            qsa_layer.update_kv_sparse(cache_seqlens, block_table, k, v, seqlen)
             if params.get("kv_only") and _kv_only_skip:
                 # EXL3_PF_SKIP kv_only (the MTP draft prompt prefill): K/V and the indexer planes are written, the block's
                 # output is discarded by the caller, so the selection, the sparse attention and everything after it are skipped.
@@ -1394,8 +1400,18 @@ class Attention(Module):
                 cs_host = params.get("cache_seqlens")
                 if isinstance(cs_host, torch.Tensor) and cs_host.device.type == "cpu" and cs_host.numel():
                     max_kv_len = int(cs_host.max())
+            # TurboQuant cache: the many-row kernel (cu/qdec_rows.cu) serves every row count 1..32 as one program per kv
+            # head (verified against the dequantized reference, relerr 0.7-1.9e-3), so the R verify rows run as ONE batched
+            # call like the quantized cache does through the BC graph path. The per-row loop below is a bitwise
+            # row-invariance device and costs R x the attention time (128K MTP verify: 49.3 ms/step of 98.0 vs 12.0 of
+            # 59.0 for the quant cache). EXL3_TQ_VERIFY_LOOP=1 keeps the loop.
+            tq_batch = False
+            if 1 < seqlen <= MAX_BSZN_GEMV_R and ov is None and os.environ.get("EXL3_TQ_VERIFY_LOOP", "0") == "0":
+                from ..cache import CacheLayer as _CLv
+                _lyr = cache if isinstance(cache, _CLv) else cache.layers[self.layer_idx, params.get("layer_instance") or 0]
+                tq_batch = bool(getattr(_lyr, "tq", False))
             if (
-                1 < seqlen <= MAX_BSZN_GEMV_R and non_causal_spans is None and
+                1 < seqlen <= MAX_BSZN_GEMV_R and non_causal_spans is None and not tq_batch and
                 os.environ.get("EXL3_VERIFY_ATTN_LOOP", "0") != "0"
             ):
                 # Row-invariant verify: the R-row paged decode tiles the KV span from the batch's single
@@ -1512,7 +1528,15 @@ class Attention(Module):
             )
 
         outs = []
-        for b in range(bsz):
+        bsz_loop = bsz
+        if _batch_qsa and qsa_cpu is not None and bsz > 1:
+            thr = self.qsa_indexer.sparse_threshold()
+            if all(int(qsa_cpu[b]) + seqlen > thr for b in range(bsz)):
+                q_idx = self.qsa_indexer.update_planes(qsa_layer, x, self.rope, block_table, qsa_cpu, params)
+                qsa_layer.update_kv_sparse(cache_seqlens, block_table, k, v, seqlen)
+                outs.append(self.qsa_indexer.sparse_attend(qsa_layer, self, q, q_idx, block_table, qsa_cpu))
+                bsz_loop = 0
+        for b in range(bsz_loop):
             sl = slice(b, b + 1)
             bt_b, cs_b = block_table[sl], cache_seqlens[sl]
             if qsa_cpu is not None:
@@ -1522,7 +1546,7 @@ class Attention(Module):
             else:
                 cpu_b, sparse = None, False
             if sparse:
-                qsa_layer.update_kv_direct(cs_b, bt_b, k[sl], v[sl], seqlen)
+                qsa_layer.update_kv_sparse(cs_b, bt_b, k[sl], v[sl], seqlen)
                 outs.append(self.qsa_indexer.sparse_attend_verify(qsa_layer, self, q[sl], q_idx, bt_b, cpu_b))
             else:
                 max_kv_len = int(cpu_b.max().item()) if cpu_b is not None else None
