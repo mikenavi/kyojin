@@ -92,3 +92,7 @@ plus eleven short regressions. Its 129-image repeat reused 9728 of 9893 tokens
 ## November 1: 1.8.3 source update
 
 Each existing contribution branch merges upstream main `03654935b84e0f68567a442dafda7e067a361818` (v1.8.3 plus startup diagnostics). The fleet merges upstream and those branches; no historical patch stack is applied. Native inputs changed, so the extension must be rebuilt. JSON, tool loop guard and bounded attachment spill remain required. Existing 512K/RoPE, media and isolation settings belong to deployment; this source update does not change them. CPU/native/GPU qualification is recorded separately.
+
+## November 2: 1.8.5 source update
+
+All three feature branches merge upstream ad1a0d84. JSON, tool loop guard and attachment spill retained. Native rebuild and CPU checks required; GPU qualification remains separate.
