@@ -96,3 +96,10 @@ Each existing contribution branch merges upstream main `03654935b84e0f68567a442d
 ## November 2: 1.8.5 source update
 
 All three feature branches merge upstream ad1a0d84. JSON, tool loop guard and attachment spill retained. Native rebuild and CPU checks required; GPU qualification remains separate.
+
+## November 4 Kyojin 1.8.8 source update
+
+All three feature branches merge upstream `79cc8e41`. The fleet retains
+native JSON, the tool-call loop guard and bounded attachment spill.
+Native rebuild and runtime qualification are tracked in the deployment
+repository.

@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
   "upstream": "https://github.com/Yamz-Labs/kyojin",
-  "upstream_base": "ad1a0d84cff8d271c590bca41703059a9efa8a15",
+  "upstream_base": "79cc8e41f5e6540c21629ca3fc1e59d46c960d2b",
   "component": "kyojin",
   "product_files": {
-    "tools/qwen/serve.py": "c91944aaf01e1bc538814f7a64845a0cefd7438b3c28fe12f9d819ce2853affb",
+    "tools/qwen/serve.py": "31885ad566465f608312e3b6b66905c549881f9563a27ca9c38242755f96379f",
     "tools/glm/serve.py": "c12f77c81fefd09842ccddc1db43b9c92a1307822d6a514e08e0e21b88dd4757",
     "tools/structured_output.py": "1432716dd08ea65cf5c85d1dbc089be9911a887a07047f03e0037c44391f60ae",
     "exllamav3/generator/filter/structured.py": "81304055f9f3b7cd5fe4962ca6f609d7e6711284b3965e4ff6c281f51f94e0c2",
@@ -16,6 +16,6 @@
   },
   "source_only_export": true,
   "target": "Linux gfx1151 with an external pinned ROCm toolchain",
-  "qualification": "Upstream 1.8.5 merged through all three feature branches; CPU/native validation pending; GPU not qualified.",
+  "qualification": "Upstream 1.8.8 merged through the three feature branches. Image, CPU and GPU qualification are recorded separately.",
   "upstream_backports": []
 }
