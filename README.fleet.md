@@ -103,3 +103,14 @@ All three feature branches merge upstream `79cc8e41`. The fleet retains
 native JSON, the tool-call loop guard and bounded attachment spill.
 Native rebuild and runtime qualification are tracked in the deployment
 repository.
+
+## November 5: Kyojin 1.8.10 source update
+
+All three feature branches merge the exact upstream v1.8.10 release
+`d83cfeb3d6a7d42a4cf2b720efb1eb8a4ff04da7`. Native JSON, tool-call loop guard
+and bounded attachment spill remain intact. The merged product tree matched
+the previous stable plus that release before updating this source lock.
+ROCm multi-row verify and n-gram steps now use the eager path; single-row
+decode can still use block graphs. Upstream GDN HF is enabled on ROCm and
+effort placement moves to the prompt tail. Native and CPU verification are
+recorded separately by deployment; GPU/task results are not inherited.

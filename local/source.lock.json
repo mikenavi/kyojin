@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
   "upstream": "https://github.com/Yamz-Labs/kyojin",
-  "upstream_base": "79cc8e41f5e6540c21629ca3fc1e59d46c960d2b",
+  "upstream_base": "d83cfeb3d6a7d42a4cf2b720efb1eb8a4ff04da7",
   "component": "kyojin",
   "product_files": {
-    "tools/qwen/serve.py": "31885ad566465f608312e3b6b66905c549881f9563a27ca9c38242755f96379f",
+    "tools/qwen/serve.py": "a9c36d914bd6ce205c0975dbbf5f71d64e0a5d58f18dde7400b9522d631e3c87",
     "tools/glm/serve.py": "c12f77c81fefd09842ccddc1db43b9c92a1307822d6a514e08e0e21b88dd4757",
     "tools/structured_output.py": "1432716dd08ea65cf5c85d1dbc089be9911a887a07047f03e0037c44391f60ae",
     "exllamav3/generator/filter/structured.py": "81304055f9f3b7cd5fe4962ca6f609d7e6711284b3965e4ff6c281f51f94e0c2",
@@ -16,6 +16,6 @@
   },
   "source_only_export": true,
   "target": "Linux gfx1151 with an external pinned ROCm toolchain",
-  "qualification": "Upstream 1.8.8 merged through the three feature branches. Image, CPU and GPU qualification are recorded separately.",
+  "qualification": "Exact upstream v1.8.10 merged through all three feature branches. CPU, native build and GPU/workload qualification belong to deployment receipts.",
   "upstream_backports": []
 }
