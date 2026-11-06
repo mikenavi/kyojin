@@ -114,3 +114,7 @@ ROCm multi-row verify and n-gram steps now use the eager path; single-row
 decode can still use block graphs. Upstream GDN HF is enabled on ROCm and
 effort placement moves to the prompt tail. Native and CPU verification are
 recorded separately by deployment; GPU/task results are not inherited.
+
+## November 6: Kyojin 1.8.11 source update
+
+All three feature branches merge upstream v1.8.11. The JSON integration preserves structured output buffering, validation and phase guards while exposing upstream progressive timings. Disk-first recurrent checkpoints and unified request timings remain upstream features; deployment cache limits and GPU qualification are separate.
