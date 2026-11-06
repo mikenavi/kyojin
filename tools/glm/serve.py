@@ -402,6 +402,8 @@ def template_kwargs(body: dict[str, Any]) -> dict[str, Any]:
     effort = pick("reasoning_effort", SERVE_DEFAULTS["reasoning_effort"])
     if effort is not None:
         kw["reasoning_effort"] = effort
+    if pick("effort_guidance", os.environ.get("KYOJIN_EFFORT_GUIDANCE") == "1"):   # opt-in medium guidance text
+        kw["effort_guidance"] = True
     return kw
 
 
@@ -944,7 +946,7 @@ class ResidentEngine:
                        cancel: asyncio.Event | None = None,
                        images: list | None = None, stats: dict | None = None, img_stats: dict | None = None,
                        prompt_ids: list[int] | None = None, ignore_eos: bool = False,
-                       loop_guard: bool | None = None, structured=None) -> AsyncIterator[str]:
+                       loop_guard: bool | None = None, structured=None, live: dict | None = None) -> AsyncIterator[str]:
         """Yield incremental decoded text. With sessions == 1 the caller serializes access to this method; with
         sessions > 1 several calls may run at once and the final stats of a request land in `stats`.
 
@@ -999,7 +1001,7 @@ class ResidentEngine:
                        stop_conditions=conditions, embeddings=embs or None,
                        **({} if rq is None else {"max_rq_tokens": rq}))
         if self.sessions > 1:
-            async for piece in self._run_shared(job, ids, cancel, stats if stats is not None else {}, t0, probe, prompt, ignore_eos, loop_guard):
+            async for piece in self._run_shared(job, ids, cancel, stats if stats is not None else {}, t0, probe, prompt, ignore_eos, loop_guard, live):
                 yield piece
             return
         loop = asyncio.get_running_loop()
@@ -1026,6 +1028,8 @@ class ResidentEngine:
                         self.last_stats = guard_stats(hit, seen)
                         return
                     seen += token_count(event)
+                    if live is not None and event.get("token_ids") is not None:
+                        live["n"] = seen                 # the generator's own count, read by the stream for the progressive timings
                     if event.get("eos"):
                         self.last_stats = event
                         if probe is not None:
@@ -1136,7 +1140,7 @@ class ResidentEngine:
                     q.put_nowait(evs)
 
     async def _run_shared(self, job, ids, cancel, stats: dict, t0: float, probe, prompt: str = "", ignore_eos: bool = False,
-                          loop_guard: bool | None = None) -> AsyncIterator[str]:
+                          loop_guard: bool | None = None, live: dict | None = None) -> AsyncIterator[str]:
         """One request's job in the shared Generator: enqueue on the driver, stream its events, and (whatever way this
         ends) remove the job, so no leftover job runs inside another request."""
         q: asyncio.Queue = asyncio.Queue()
@@ -1170,6 +1174,8 @@ class ResidentEngine:
                         self.last_stats = stats
                         return                  # the finally block cancels the job
                     seen += token_count(event)
+                    if live is not None and event.get("token_ids") is not None:
+                        live["n"] = seen
                     if event.get("eos"):
                         stats.update(event)
                         self.last_stats = stats
@@ -1483,7 +1489,7 @@ def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = Fa
                 continue
             store = getattr(engine, "slot_store", None)
             processing += 1  # admitted: counted from the dequeue, incl. lock and slot restore
-            started = time.perf_counter()
+            started = body["_job_at"] = time.perf_counter()
             first_token = False             # flipped once, so the log gets exactly one job_first_token line
             try:
                 async with admit(body.get("_cache_salt")):
@@ -1507,10 +1513,12 @@ def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = Fa
                             **({"prompt_ids": body["_prompt_ids"]} if body.get("_prompt_ids") is not None else {}),
                             **({"ignore_eos": True} if body.get("_ignore_eos") else {}),
                             **({"loop_guard": body["_loop_guard"]} if body.get("_loop_guard") is not None else {}),
+                            live=body.setdefault("_live", {}),
                             **({"stats": request_stats} if sessions > 1 else {}),
                             **({"structured": body["_structured"]} if body.get("_structured") is not None else {})):
                             if not first_token:
                                 first_token = True
+                                body["_first_at"] = time.perf_counter()
                                 lifecycle.first_token(rid, started,
                                                       prompt_tokens=body.get("_prompt_tokens"))
                             out.put_nowait(delta)
@@ -1685,15 +1693,8 @@ def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = Fa
 
         def timings(raw: str) -> dict[str, Any]:
             # llama.cpp names: the swap orchestrator reads cache_n as the verdict of a KV restore
-            st = request_stats
-            cache_n = int(st.get("cached_tokens", 0))
-            pre, gen = st.get("time_prefill") or 0.0, st.get("time_generate") or 0.0
-            n = int(st.get("new_tokens", 0))
-            return {"cache_n": cache_n, "prompt_n": max(prompt_tokens - cache_n, 0),
-                    "prompt_ms": pre * 1000, "predicted_n": n, "predicted_ms": gen * 1000,
-                    "prompt_per_second": (prompt_tokens - cache_n) / pre if pre else 0.0,
-                    "predicted_per_second": n / gen if gen else 0.0,
-                    **({"loop_guard": st["loop_guard"]} if st.get("loop_guard") else {})}
+            return serve_compat.stats_timings(prompt_tokens, request_stats,
+                                              **({"loop_guard": request_stats["loop_guard"]} if request_stats.get("loop_guard") else {}))
 
         if body.get("stream", False):
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
@@ -1705,6 +1706,7 @@ def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = Fa
             text, done, mode = prefix, len(prefix), "reasoning" if prefix else "content"
             holds = ["</think>", "<think>", TOOL_OPEN] + [x for x in body["_stop"] if x]
             visible: list[float] = []   # set at the first frame with text in it: the client's first sign of life
+            live = serve_compat.LiveTimings(body, prompt_tokens, lambda: request_stats)   # progressive timings, once per second
 
             async def flush(final: bool) -> None:
                 nonlocal done, mode
@@ -1718,7 +1720,7 @@ def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = Fa
                             visible.append(time.perf_counter())
                             lifecycle.first_content(body["_reqid"], body["_queued_at"])
                         key = "reasoning_content" if mode == "reasoning" else "content"
-                        await writer.write(sse(event({key: piece})))
+                        await writer.write(sse(event({key: piece}) | ({"timings": t} if (t := live.take()) else {})))
                         ping.note_output()   # the client has text: comments wait for the next silence
                     done = end
                     if not hits:
@@ -1734,6 +1736,8 @@ def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = Fa
                     text += delta
                     if structured is None:
                         await flush(False)
+                    if (t := live.take()) is not None:     # nothing went out for a second (held tool call, tags): an empty delta carries them
+                        await writer.write(sse(event({}) | {"timings": t}))
                 text, _ = stop_text(text, body["_stop"])
                 if structured is None:
                     await flush(True)
